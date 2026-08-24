@@ -470,3 +470,26 @@ Après l'index : le stage racine devient `"FETCH"` avec un `inputStage` en **`"I
 `totalDocsExamined` passe de **25309 à 345** (exactement le nombre de documents retournés — l'index cible
 directement les bons documents au lieu de scanner toute la collection), `totalKeysExamined: 345`,
 `executionTimeMillis: 1` (contre 12 sans index).
+
+**B2. Géospatial.** Même logique qu'en B1 : mesure prise sur l'état final de la collection (25309 documents), pas
+sur l'import brut.
+```js
+db.restaurants.createIndex({ "address.coord": "2dsphere" })
+```
+→ `"address.coord_2dsphere"`
+
+```js
+db.restaurants.find({
+  "address.coord": {
+    $near: {
+      $geometry: { type: "Point", coordinates: [-73.9857, 40.7484] }, // Times Square, Manhattan
+      $maxDistance: 500
+    }
+  }
+}, { name: 1, "address.coord": 1, borough: 1, _id: 0 })
+```
+→ **413 restaurants** à moins de 500 m du point choisi (zone très dense de Manhattan) — un de moins que sur
+l'import brut (414) : l'un des 51 documents `borough: "Missing"` supprimés en Q25 avait des coordonnées valides
+dans ce périmètre malgré son arrondissement corrompu. Aperçu des 3 premiers résultats (triés par proximité
+croissante par `$near`) : "Legends Nyc", "Foley'S N.Y. Pub And Restaurant", "Smash Burger" — tous à quelques
+dizaines de mètres du point de référence.
