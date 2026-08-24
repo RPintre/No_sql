@@ -442,3 +442,31 @@ calcul ci-dessus, je basculerais vers un modèle référencé (collection `grade
 étrangère) à partir de quelques milliers de notes par restaurant (par exemple > 5000) — bien avant la limite des 16
 Mo, mais au point où le document devient disproportionné par rapport aux besoins réels de lecture, qui ne portent le
 plus souvent que sur les dernières notes.
+
+---
+
+## Pour aller plus loin (facultatif)
+
+Mesure prise sur la collection dans son état **final** (après Q20-Q23 et Q25 de la Partie 3-4 : 25309 documents,
+345 de cuisine French), et non sur l'import brut — la Q23 ajoute un restaurant French (344→345) et la Q25 retire
+des documents (25359→25309), ce qui change le résultat ci-dessous par rapport à un import vierge.
+
+**B1. Index.**
+```js
+db.restaurants.find({ cuisine: "French" }).explain("executionStats")
+```
+Avant l'index : `stage: "COLLSCAN"`, `totalDocsExamined: 25309`, `totalKeysExamined: 0`, `nReturned: 345`,
+`executionTimeMillis: 12`.
+
+```js
+db.restaurants.createIndex({ cuisine: 1 })
+```
+→ `"cuisine_1"`
+
+```js
+db.restaurants.find({ cuisine: "French" }).explain("executionStats")
+```
+Après l'index : le stage racine devient `"FETCH"` avec un `inputStage` en **`"IXSCAN"`** (donc COLLSCAN → IXSCAN).
+`totalDocsExamined` passe de **25309 à 345** (exactement le nombre de documents retournés — l'index cible
+directement les bons documents au lieu de scanner toute la collection), `totalKeysExamined: 345`,
+`executionTimeMillis: 1` (contre 12 sans index).
