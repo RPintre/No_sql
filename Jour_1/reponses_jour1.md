@@ -299,3 +299,38 @@ db.restaurants.updateMany(
 ```
 → **matchedCount: 345, modifiedCount: 345** (344 restaurants French d'origine + 1 : le restaurant fictif inséré en
 Q20, lui aussi `cuisine: "French"`).
+
+---
+
+## Partie 4 — Suppression & qualité de données
+
+**Q24.**
+```js
+db.restaurants.countDocuments({ borough: "Missing" })
+```
+→ **51**
+
+**Q25.**
+```js
+db.restaurants.deleteMany({ borough: "Missing" })
+```
+→ `{ deletedCount: 51 }`
+```js
+db.restaurants.countDocuments({})
+```
+→ **25309**
+
+**Q26.**
+
+(a)
+```js
+db.restaurants.countDocuments({ grades: { $size: 0 } })
+```
+→ **737** (738 en Q14, moins 1 : l'un des 51 documents `borough: "Missing"` supprimés en Q25 avait justement un
+tableau `grades` vide). Rapporté à l'effectif actuel (25309) : **737 / 25309 ≈ 2,91 %**.
+
+(b) Les deux anomalies ne sont pas de même nature. `borough: "Missing"` est **irrécupérable** : rien dans le
+document ne permet de déduire l'arrondissement réel — le document est corrompu sans valeur d'usage. Un tableau
+`grades` vide est une **absence d'information légitime et temporaire** (le restaurant existe, n'a simplement pas
+encore été inspecté) : le document reste exploitable pour toute requête ne portant pas sur `grades`. On supprime ce
+qui est cassé, on conserve ce qui est seulement incomplet.
