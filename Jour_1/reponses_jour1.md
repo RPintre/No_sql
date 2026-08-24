@@ -249,3 +249,53 @@ db.restaurants.find({}, { name: 1, "grades.score": 1, _id: 0 })
   .limit(1)
 ```
 → **name: "Murals On 54/Randolphs'S", score: 131**
+
+---
+
+## Partie 3 — Création & mise à jour
+
+**Q20.**
+```js
+db.restaurants.insertOne({
+  name: "RP - Restaurant Fictif TP",
+  borough: "Montpellier",
+  cuisine: "French",
+  address: { building: "", street: "Simulation", zipcode: "", coord: [3.8767, 43.6108] },
+  grades: [ { grade: "A", score: 7, date: new Date() } ]
+})
+```
+→ `{ acknowledged: true, insertedId: ObjectId('...') }`
+```js
+db.restaurants.findOne({ name: "RP - Restaurant Fictif TP" })
+```
+→ 1 document trouvé, conforme. Total collection : **25360**.
+
+**Q21.**
+```js
+db.restaurants.updateOne(
+  { restaurant_id: "30075445" },
+  { $push: { grades: { grade: "A", score: 3, date: new Date() } } }
+)
+```
+→ `{ matchedCount: 1, modifiedCount: 1 }`. Ce restaurant avait 5 notes (bsonsize du document avant push : **478
+octets**), il en a désormais **6** (bsonsize après push : **524 octets**).
+
+**Q22.**
+```js
+db.restaurants.updateMany(
+  { "grades.score": { $gt: 50 } },
+  { $set: { risque: "eleve" } }
+)
+```
+→ **matchedCount: 349, modifiedCount: 349** (identique à Q12 : le restaurant fictif de Q20, dont l'unique note a un
+score de 7, n'entre pas dans ce filtre).
+
+**Q23.**
+```js
+db.restaurants.updateMany(
+  { cuisine: "French" },
+  { $set: { label_qualite: true } }
+)
+```
+→ **matchedCount: 345, modifiedCount: 345** (344 restaurants French d'origine + 1 : le restaurant fictif inséré en
+Q20, lui aussi `cuisine: "French"`).
