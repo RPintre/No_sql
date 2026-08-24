@@ -382,3 +382,63 @@ Sortie mongoexport : `exported 969 records`.
 db.restaurants.countDocuments({ borough: "Staten Island" })
 ```
 → **969** — confirmé par comptage de lignes du fichier exporté (`staten_island.json`, joint).
+
+---
+
+## Partie 6 — Réflexion
+
+**R1. Les 5 V, chiffrés.**
+
+- **Volume** : 25 359 restaurants (Q1) portant 93 463 sous-documents de notes au total, dont 93 450 avec un score
+  chiffré (Q18b) — un `find()` sans index sur ce volume dégénère vite en scan complet.
+- **Variété** : 85 valeurs de `cuisine` distinctes déclarées (Q2), structure hétérogène combinant scalaires
+  (`name`, `borough`), sous-document (`address` avec `coord`), et tableau de sous-documents de taille variable — de
+  0 élément (738 restaurants, Q14) à 6 éléments ou plus (3864 restaurants, Q15).
+- **Véracité** : le champ censé être fiable ne l'est pas toujours, à plusieurs niveaux vérifiés dans ce TP. 13 notes
+  ont un score négatif absurde (Q18a) et 13 autres un score `null` (découverte Q18), mais l'impact sur la moyenne
+  globale n'est que de 0,015 % (Q18b) — négligeable. À l'inverse, 51 documents ont un `borough: "Missing"`
+  totalement irrécupérable (Q24), et même le champ `cuisine`, en apparence propre, contient un doublon d'encodage :
+  `"Café/Coffee/Tea"` (1210 restaurants) et `"CafÃ©/Coffee/Tea"` (2 restaurants) sont la même valeur corrompue deux
+  fois (Q2/Q27) — le vrai nombre de cuisines distinctes est 84, pas 85.
+
+**R2. CAP & BASE, appliqué à ce service.**
+
+Prenons "Morris Park Bake Shop" (Q11) : il vient d'être fermé pour insalubrité, écriture qui survient au moment
+précis d'une partition réseau entre deux datacenters.
+
+- **(a) Si l'on choisit C (cohérence)** : le nœud qui ne peut pas garantir avoir la dernière version refuse de
+  répondre plutôt que de renvoyer une donnée potentiellement périmée. L'usager voit une erreur ou une
+  indisponibilité temporaire, mais **jamais** l'ancienne note à la place de la fermeture.
+- **(b) Si l'on choisit A (disponibilité)** : le service répond toujours, y compris depuis un réplica qui n'a pas
+  encore reçu l'écriture de fermeture. L'usager peut voir "Morris Park Bake Shop — Grade A" et s'y rendre, alors que
+  le restaurant vient d'être fermé pour insalubrité.
+
+Je tranche pour **C**. Pour un service de santé publique, le dommage d'une indisponibilité de quelques secondes est
+sans commune mesure avec celui d'envoyer quelqu'un manger dans un établissement fermé pour insalubrité sur la foi
+d'une donnée périmée. Le dommage accepté en choisissant C est un dommage de **disponibilité** : pendant la
+partition, une partie des usagers n'a tout simplement pas accès à l'information, plutôt que d'avoir accès à une
+information potentiellement fausse — cohérent avec le choix par défaut de MongoDB (système **CP**).
+
+**R3. Embarqué vs référencé — le calcul.**
+
+(a) 3864 restaurants ont au moins 6 notes (Q15) ; le restaurant modifié en Q21 en a désormais 6. Mesures avec
+`bsonsize()` dans `mongosh` sur `restaurant_id: "30075445"` :
+- document sans aucune note (`grades: []`) : **248 octets**
+- une note isolée : **43 octets**
+- document complet avec 5 notes (avant Q21) : **478 octets** — cohérent avec 248 + 5×43 = 463 octets, l'écart
+  provenant du léger surcoût d'index de tableau BSON
+- document complet avec 6 notes (après Q21) : **524 octets**
+
+(b) 520 notes (une inspection hebdomadaire pendant 10 ans) donneraient un document d'environ
+248 + 520 × 43 ≈ **22 608 octets, soit ≈ 22,1 Ko**. La taille maximale d'un document BSON est de **16 Mo**
+(16 777 216 octets). 22,1 Ko ne représente que **≈ 0,135 %** de cette limite : le modèle embarqué **tient très
+largement** pour ce cas d'usage réel.
+
+(c) **Avantage** : un seul accès (`findOne`) suffit pour récupérer un restaurant et tout son historique de notes,
+sans jointure (`$lookup`). **Limite** : le tableau ne fait que grossir (aucune purge dans ce modèle), et toute
+écriture (`$push`) réécrit potentiellement le document entier ; un pattern d'usage plus intense (capteurs,
+événements très fréquents) ferait grossir le tableau vers des dizaines de milliers d'éléments. Compte tenu du
+calcul ci-dessus, je basculerais vers un modèle référencé (collection `grades` séparée avec `restaurant_id` en clé
+étrangère) à partir de quelques milliers de notes par restaurant (par exemple > 5000) — bien avant la limite des 16
+Mo, mais au point où le document devient disproportionné par rapport aux besoins réels de lecture, qui ne portent le
+plus souvent que sur les dernières notes.
