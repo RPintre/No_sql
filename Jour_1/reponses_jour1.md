@@ -334,3 +334,51 @@ document ne permet de déduire l'arrondissement réel — le document est corrom
 `grades` vide est une **absence d'information légitime et temporaire** (le restaurant existe, n'a simplement pas
 encore été inspecté) : le document reste exploitable pour toute requête ne portant pas sur `grades`. On supprime ce
 qui est cassé, on conserve ce qui est seulement incomplet.
+
+---
+
+## Partie 5 — Automatisation
+
+**Q27.** Voir [`rapport.js`](rapport.js). Exécution :
+```bash
+docker exec -i mongo-ipssi mongosh -u admin -p ipssi2025 --authenticationDatabase admin nyc < rapport.js
+```
+Sortie :
+- **Total : 25309**
+- **Top 5 cuisines** : American (6173), Chinese (2412), Café/Coffee/Tea (1210), Pizza (1162), Italian (1069)
+- **Par arrondissement** : Bronx 2338, Brooklyn 6086, Manhattan 10259, **Montpellier 1**, Queens 5656,
+  Staten Island 969
+
+En construisant ce classement, `db.restaurants.distinct("cuisine")` fait apparaître deux valeurs quasi identiques :
+`"Café/Coffee/Tea"` (1210 restaurants) et `"CafÃ©/Coffee/Tea"` (2 restaurants) — un double encodage UTF‑8/Latin‑1 du
+"é" stocké en base. Ce sont donc 84 cuisines réellement distinctes, pas 85 (Q2).
+
+**Écart entre le total (25309) et Q1 (25359) : −50.**
+
+| Opération | Effet sur le total |
+|---|---|
+| Q1 (état initial) | 25359 |
+| Q20 — `insertOne` (restaurant fictif) | +1 → 25360 |
+| Q21 — `$push` (ajoute une note, pas un document) | 0 → 25360 |
+| Q22 — `updateMany` (ajoute un champ, pas un document) | 0 → 25360 |
+| Q23 — `updateMany` (ajoute un champ, pas un document) | 0 → 25360 |
+| Q25 — `deleteMany({ borough: "Missing" })` | −51 → 25309 |
+| **Total final** | **25309** (25359 − 50) |
+
+La liste des arrondissements contient désormais **"Montpellier"** (issu du restaurant fictif de Q20), et
+**"Missing" a disparu** (51 documents supprimés en Q25).
+
+**Q28.**
+```bash
+docker exec mongo-ipssi mongoexport \
+  --username admin --password ipssi2025 --authenticationDatabase admin \
+  --db nyc --collection restaurants \
+  --queryFile /tmp/_query.json \
+  --out /tmp/staten_island.json
+# _query.json contient : {"borough":"Staten Island"}
+```
+Sortie mongoexport : `exported 969 records`.
+```js
+db.restaurants.countDocuments({ borough: "Staten Island" })
+```
+→ **969** — confirmé par comptage de lignes du fichier exporté (`staten_island.json`, joint).
