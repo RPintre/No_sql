@@ -181,3 +181,28 @@ commentaires les plus récents (`{ name, text, date }`). Vérifié sur *The Taki
 d'un aperçu "commentaires récents" sur une fiche film n'a besoin que d'un échantillon borné et petit — embarquer
 la totalité romprait la borne de taille du document et redeviendrait un problème de synchronisation (comme
 `num_mflix_comments`) à chaque nouveau commentaire.
+
+---
+
+## Partie 5 — Transaction ACID multi-documents
+
+Voir [`transaction.js`](transaction.js), exécutée sur une instance dédiée en replica set :
+```bash
+docker run -d --name mongo-rs -p 27018:27017 mongo:7.0 --replSet rs0
+docker exec mongo-rs mongosh --port 27017 --eval "rc = rs.initiate()"
+# reimport movies.json / comments.json dans cette instance, puis :
+docker exec -i mongo-rs mongosh --port 27017 mflix < transaction.js
+```
+
+**Q19.** Scénario **commit** : film *Upstream*, `num_mflix_comments` 4 → **3**, nombre réel de commentaires 3 →
+**2** (suppression + décrément appliqués ensemble). Scénario **abort** : film *Wings*, une erreur métier est
+simulée entre les deux écritures et `abortTransaction()` est appelé — résultat : `num_mflix_comments` reste à
+**4**, le commentaire ciblé existe **toujours** en base (`comment2_existe_toujours: true`). Rien n'a été appliqué
+partiellement.
+
+Ce que garantit chaque lettre ici : **A**tomicité — la suppression du commentaire et le décrément du compteur
+réussissent ou échouent ensemble, jamais l'un sans l'autre (prouvé par le scénario abort) ; **C**ohérence — le
+compteur ne peut jamais être observé désynchronisé du nombre réel de commentaires à l'issue d'une transaction ;
+**I**solation — aucune lecture concurrente ne peut voir un état intermédiaire (commentaire supprimé mais compteur
+pas encore décrémenté) ; **D**urabilité — une fois `commitTransaction()` retourné, les deux écritures sont
+persistées et survivraient à un redémarrage du nœud.
