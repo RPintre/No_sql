@@ -27,6 +27,23 @@ Index créé dans l'ordre ESR : `createIndex({ genres: 1, "imdb.rating": -1, yea
 
 Le tri est intégralement couvert par l'index (aucun stage `SORT` en mémoire dans le plan).
 
+## R3 — Vérification expérimentale de la règle ESR (index dans le mauvais ordre)
+
+Second index créé volontairement dans le **mauvais ordre** :
+`createIndex({ genres: 1, year: 1, "imdb.rating": -1 })` (Equality, Range, Sort au lieu de Equality, Sort, Range).
+
+Même requête, chaque plan forcé avec `.hint()` :
+
+| Index (via `.hint()`) | stage | totalKeysExamined | totalDocsExamined | nReturned | stage `SORT` ? | executionTimeMillis |
+|---|---|---|---|---|---|---|
+| `genres_1_imdb.rating_-1_year_1` (ESR, bon ordre) | FETCH | **7834** | 7761 | 7761 | non | **23** |
+| `genres_1_year_1_imdb.rating_-1` (mauvais ordre) | FETCH | **7761** | 7761 | 7761 | **oui** | **55** |
+
+Écart : l'index dans le mauvais ordre examine *moins* de clés (7761 vs 7834 — il n'a pas à parcourir les entrées
+`imdb.rating` intermédiaires), mais il doit ensuite **trier 7761 documents en mémoire** (stage `SORT`), ce qui le
+rend **2,4× plus lent** en temps réel (55 ms contre 23 ms) malgré un `totalKeysExamined` plus faible. Le nombre de
+clés examinées ne raconte donc pas toute l'histoire : c'est le coût du tri en mémoire qui domine ici.
+
 ## Q9 — Index text
 
 | | Résultat |

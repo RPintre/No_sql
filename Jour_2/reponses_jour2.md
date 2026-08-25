@@ -206,3 +206,60 @@ compteur ne peut jamais être observé désynchronisé du nombre réel de commen
 **I**solation — aucune lecture concurrente ne peut voir un état intermédiaire (commentaire supprimé mais compteur
 pas encore décrémenté) ; **D**urabilité — une fois `commitTransaction()` retourné, les deux écritures sont
 persistées et survivraient à un redémarrage du nœud.
+
+---
+
+## Partie 6 — Réflexion
+
+**R1. Ce que le SGBD ne fait plus pour vous.**
+
+MongoDB ne vérifie aucune contrainte de clé étrangère : la responsabilité de l'intégrité référentielle passe
+entièrement à l'application. Chiffré : **9224** commentaires orphelins (Q2) sur **50304** au total (Q1), soit
+**18,34 %** de la collection `comments` qui pointe dans le vide. Deux stratégies côté application :
+1. **Vérifier l'existence du film avant insertion** d'un commentaire (un `findOne` supplémentaire) — coûte une
+   requête réseau de plus par écriture (latence, charge), mais ne protège pas contre une suppression *ultérieure*
+   du film référencé.
+2. **Job de nettoyage périodique** (agrégation `$lookup` comme en Q2, exécutée en batch) — peu coûteux en continu,
+   mais laisse une fenêtre de temps où des orphelins existent réellement en base entre deux passages, donc une
+   couverture seulement partielle et différée.
+
+**R2. Embed vs reference — la borne.**
+
+Référencer est le bon choix ici. Le film le plus commenté (Q15) porte **161** commentaires — en reprenant la
+méthode du Jour 1 (R3) : un commentaire pèse **196 octets** (`bsonsize`), un document film sans les commentaires
+pèse environ **2902 octets** (mesuré sur *The Taking of Pelham 1 2 3*). En imbriquant les 161 commentaires :
+2902 + 161 × 196 ≈ **34 458 octets, soit ≈ 33,6 Ko** — ridiculement loin de la limite des 16 Mo. **Ce n'est donc
+pas la taille qui tranche** : ce sont (a) la fréquence d'écriture indépendante — de nouveaux commentaires arrivent
+en continu, sans rapport avec les mises à jour du film, et imbriquer forcerait à réécrire tout le document film à
+chaque commentaire ; (b) le besoin de requêter les commentaires indépendamment des films (modération, recherche
+par auteur, flux chronologique global) ; (c) une relation 1:n non bornée dans un vrai système de production, même
+si elle est ici plafonnée à 161 par ce jeu de données figé. On imbriquerait quand même dans le cas précis d'un
+**sous-ensemble borné et à faible cardinalité** — exactement ce que fait le Subset Pattern de Q18 (3 derniers
+commentaires), où la taille et la fréquence de mise à jour redeviennent négligeables.
+
+**R3. ESR — vérifié par l'expérience.**
+
+Voir le détail chiffré dans [`index_bench.md`](index_bench.md#r3--vérification-expérimentale-de-la-règle-esr-index-dans-le-mauvais-ordre).
+L'ordre Equality → Sort → Range est optimal parce que : le champ d'**égalité** réduit d'abord le sous-arbre du
+B-tree à parcourir ; le champ de **tri** placé juste après permet à MongoDB de lire les entrées de l'index déjà
+dans l'ordre voulu (pas de tri en mémoire) ; le champ de **plage** doit venir en dernier car une comparaison `$gte`
+« ouvre » un intervalle continu dans l'index — le placer avant le champ de tri casserait l'ordre trié pour les
+champs suivants. (a) Avec l'index dans le mauvais ordre (`genres, year, imdb.rating`), un stage `SORT` **apparaît**
+bien ; `totalKeysExamined` : **7834** (bon ordre) vs **7761** (mauvais ordre) ; `totalDocsExamined` : **7761**
+dans les deux cas. (b) Contre-intuitivement, le mauvais ordre examine *moins* de clés, mais le stage `SORT` en
+mémoire le rend **2,4× plus lent** en pratique (55 ms vs 23 ms, mesuré) — c'est donc bien le pire des deux malgré
+un `totalKeysExamined` plus favorable en apparence. (c) Si le tri en mémoire dépasse les 32 Mo autorisés par
+défaut, MongoDB lève une erreur (`QueryExceededMemoryLimitNoDiskUseAllowed`) sauf si l'option `allowDiskUse: true`
+est passée à l'agrégation/la requête, auquel cas le tri déborde sur disque au prix d'une latence bien plus élevée.
+
+**R4. Patterns — le bénéfice et sa facture.**
+
+Le champ `num_mflix_comments` illustre le Computed Pattern. **Bénéfice** chiffré : sans lui, afficher le nombre de
+commentaires d'un film nécessiterait un comptage à la demande sur la collection `comments` — potentiellement pour
+chacun des **14245** films effectivement référencés par au moins un commentaire (Q3), à chaque affichage de fiche
+film, sur un système à fort trafic. **Risque** chiffré : sur les 15740 films portant le champ, **12244** avaient un
+compteur faux avant correction (Q16), soit **77,79 %** — un taux d'erreur qui rend le champ quasiment
+inexploitable tel quel avant réconciliation. Conclusion : ce pattern n'est acceptable en production qu'à condition
+d'être **maintenu automatiquement et de façon atomique** à chaque écriture affectant le compteur (typiquement via
+la même transaction que celle utilisée en Q19, ou un `$inc` déclenché par un trigger applicatif), et non recalculé
+« un jour peut-être » en tâche de fond comme semble l'avoir été ce jeu de données.
