@@ -98,3 +98,40 @@ db.movies.countDocuments({ "imdb.rating": "" })
 ces chaînes vides selon l'opérateur utilisé, ou plus insidieusement, un calcul fait côté application (Python,
 `sum()/len()`) sur les valeurs brutes ferait planter le programme ou fausserait silencieusement le compte du
 dénominateur si les `""` sont mal filtrées.
+
+---
+
+## Partie 2 — Indexation & `explain()`
+
+Voir [`index_bench.md`](index_bench.md) pour le tableau complet avant/après (Q7, Q8, Q9, Q10).
+
+**Q7.** Avant index : `COLLSCAN`, `totalDocsExamined: 23539`, `nReturned: 105`. Après
+`createIndex({ genres: 1 })` : `FETCH` (inputStage `IXSCAN`), `totalDocsExamined: 105`.
+
+**Q8.** (a) **7761** films `{ genres: "Drama", year: { $gte: 2000 } }`. (b) Ordre ESR :
+`createIndex({ genres: 1, "imdb.rating": -1, year: 1 })` — `genres` en égalité, `imdb.rating` pour le tri,
+`year` en dernier (plage) : la règle ESR place le champ de tri **avant** le champ de plage pour que l'index reste
+exploitable pour trier après avoir filtré sur l'égalité. (c) Aucun stage `SORT` en mémoire : le tri est couvert par
+l'index (voir `index_bench.md`).
+
+**Q9.** (a) Regex `Godfather` (sensible à la casse) : **5** films. (b) Index text + `$text: {$search:"godfather"}` :
+**12** films. (c) Écart de **7**, tous trouvés via leur `plot` et non leur `title` — ex. *"Jane Austen's Mafia!"*,
+*"The Nutcracker in 3D"*, *"C(r)ook"* (leur résumé mentionne "godfather" sans que ce soit dans le titre). (d)
+`$text` sur "godfathers" (pluriel) renvoie aussi **12** résultats, identique à (b) : le stemming réduit "godfathers"
+à la même racine que "godfather", donc même résultat — un `$regex` sur `/godfathers/` n'aurait, lui, trouvé
+**aucun** des films dont le titre/plot contient "godfather" au singulier. (e) Le `$regex` reste préférable pour
+chercher une **sous-chaîne qui n'est pas un mot entier** — un numéro de série, un fragment de code, une référence
+partielle — car `$text` tokenise par mot entier et ne peut pas matcher un sous-mot.
+
+**Q10.**
+```js
+db.movies.getIndexes()
+```
+→ 4 index avant suppression : `_id_` (jamais créé explicitement — existe par défaut sur toute collection),
+`genres_1`, `genres_1_imdb.rating_-1_year_1`, `title_text_plot_text`.
+```js
+db.movies.dropIndex("title_text_plot_text")
+```
+→ `{ nIndexesWas: 4, ok: 1 }`. Un index inutilisé est un coût pur : il doit être mis à jour à **chaque écriture**
+(insert/update/delete) sur les champs indexés, occupe de l'espace disque et RAM (working set), sans jamais
+apporter de bénéfice en lecture puisqu'aucune requête ne l'utilise.
