@@ -159,3 +159,25 @@ ordre déterministe entre ex æquo ; deux exécutions ont effectivement renvoyé
 (*Terminator Salvation*, *About a Boy*, *50 First Dates*, *Ocean's Eleven*) — même remarque que Q14 sur le
 non-déterminisme du tri en cas d'égalité au-delà de la 1ʳᵉ place. Le chiffre 161 confirme indépendamment le
 `real_count` déjà relevé en Q4b pour ce même film.
+
+---
+
+## Partie 4 — Drivers : PyMongo
+
+Voir [`patterns.py`](patterns.py). Exécution : `python patterns.py` (PyMongo 4.17.0).
+
+**Q16.** Réconciliation : sur les **15740** films portant `num_mflix_comments`, **12244** ont un compteur
+incohérent avec le nombre réel de commentaires, soit **77,79 %**.
+
+**Q17.**
+```python
+db.movies.bulk_write(ops)  # ops = liste d'UpdateOne, un par film incohérent
+```
+→ `matchedCount: 12244`, `modifiedCount: 12244`. Re-vérification de Q16 : **0** incohérence restante.
+
+**Q18.** Subset Pattern appliqué aux 10 films les plus commentés : champ `recent_comments` ajouté avec les 3
+commentaires les plus récents (`{ name, text, date }`). Vérifié sur *The Taking of Pelham 1 2 3* :
+`recent_comments.length === 3`. On n'embarque que 3 commentaires (et non les 161) parce que l'usage principal
+d'un aperçu "commentaires récents" sur une fiche film n'a besoin que d'un échantillon borné et petit — embarquer
+la totalité romprait la borne de taille du document et redeviendrait un problème de synchronisation (comme
+`num_mflix_comments`) à chaque nouveau commentaire.
