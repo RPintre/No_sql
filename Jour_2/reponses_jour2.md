@@ -135,3 +135,27 @@ db.movies.dropIndex("title_text_plot_text")
 → `{ nIndexesWas: 4, ok: 1 }`. Un index inutilisé est un coût pur : il doit être mis à jour à **chaque écriture**
 (insert/update/delete) sur les champs indexés, occupe de l'espace disque et RAM (working set), sans jamais
 apporter de bénéfice en lecture puisqu'aucune requête ne l'utilise.
+
+---
+
+## Partie 3 — Agrégation analytique
+
+Voir [`analyses.js`](analyses.js). Exécution :
+```bash
+docker exec -i mongo-ipssi mongosh -u admin -p ipssi2025 --authenticationDatabase admin mflix < analyses.js
+```
+
+**Q11.** Top 5 genres : Drama (13789), Comedy (7024), Romance (3665), Crime (2678), Thriller (2658).
+
+**Q12.** Top 3 décennies : 2000 (7749 films), 2010 (5972), 1990 (3773).
+
+**Q13.** Note IMDB moyenne des films Drama : **6,8276** sur **12377** films comptés (notes numériques uniquement).
+
+**Q14.** Top réalisateurs : Woody Allen (40), John Ford (35), puis une **égalité à 34** entre John Huston et
+Takashi Miike pour la 3ᵉ place — le pipeline `$sort: { count: -1 }` sans clé de tri secondaire ne garantit pas un
+ordre déterministe entre ex æquo ; deux exécutions ont effectivement renvoyé l'un ou l'autre en position 3.
+
+**Q15.** Top 5 films les plus commentés : *The Taking of Pelham 1 2 3* (**161**), puis **4 films à égalité à 158**
+(*Terminator Salvation*, *About a Boy*, *50 First Dates*, *Ocean's Eleven*) — même remarque que Q14 sur le
+non-déterminisme du tri en cas d'égalité au-delà de la 1ʳᵉ place. Le chiffre 161 confirme indépendamment le
+`real_count` déjà relevé en Q4b pour ce même film.
