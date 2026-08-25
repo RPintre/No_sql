@@ -263,3 +263,25 @@ inexploitable tel quel avant réconciliation. Conclusion : ce pattern n'est acce
 d'être **maintenu automatiquement et de façon atomique** à chaque écriture affectant le compteur (typiquement via
 la même transaction que celle utilisée en Q19, ou un `$inc` déclenché par un trigger applicatif), et non recalculé
 « un jour peut-être » en tâche de fond comme semble l'avoir été ce jeu de données.
+
+---
+
+## Pour aller plus loin (facultatif)
+
+**B1. Covered query.** Détail complet dans [`index_bench.md`](index_bench.md#b1--covered-query). Avec
+`createIndex({ year: 1 })` et `db.movies.find({ year: 2000 }, { year: 1, _id: 0 })` : stage
+**`PROJECTION_COVERED`**, **`totalDocsExamined: 0`** — le résultat est lu entièrement depuis l'index, sans jamais
+toucher les documents de la collection.
+
+**B2. Index partiel.** **254** films `{ type: "series" }`. Index complet sur `title` : **483 328 octets**. Index
+partiel restreint à `type: "series"` : **24 576 octets** — soit **≈ 19,7× plus léger**. Détail dans
+[`index_bench.md`](index_bench.md#b2--index-partiel-vs-index-complet).
+
+**B3. TTL.**
+```js
+db.sessions.createIndex({ createdAt: 1 }, { expireAfterSeconds: 3600 })
+```
+Index TTL créé et vérifié (`expireAfterSeconds: 3600` visible dans `getIndexes()`). Cas d'usage typique : purge
+automatique de sessions applicatives ou de jetons temporaires — le document est automatiquement supprimé par un
+processus MongoDB en arrière-plan 3600 s après la valeur de `createdAt`, sans qu'aucun job de nettoyage applicatif
+ne soit nécessaire.

@@ -61,3 +61,27 @@ db.movies.getIndexes()
 → `_id_` (jamais créé explicitement, existe par défaut), `genres_1`, `genres_1_imdb.rating_-1_year_1`,
 `title_text_plot_text`. L'index text a été supprimé après Q10 (`dropIndex("title_text_plot_text")`,
 `nIndexesWas: 4`).
+
+## B1 — Covered query
+
+Index `createIndex({ year: 1 })`, requête `db.movies.find({ year: 2000 }, { year: 1, _id: 0 })` :
+
+| | stage | totalDocsExamined | totalKeysExamined | nReturned |
+|---|---|---|---|---|
+| Requête couverte | **PROJECTION_COVERED** | **0** | 618 | 618 |
+| Comparaison : même filtre + `title` en projection (hors index) | PROJECTION_SIMPLE (implique un FETCH) | 618 | — | 618 |
+
+Dès qu'un champ hors index est demandé en projection, `totalDocsExamined` repasse à 618 : la requête n'est plus
+couverte.
+
+## B2 — Index partiel vs index complet
+
+`db.movies.countDocuments({ type: "series" })` = **254** documents.
+
+| Index sur `title` | Taille (`db.movies.stats().indexSizes`) |
+|---|---|
+| Complet (`title_full`, tous les documents) | 483 328 octets (≈ 472 Ko) |
+| Partiel (`title_series_partial`, `partialFilterExpression: { type: "series" }`) | 24 576 octets (≈ 24 Ko) |
+
+Gain : l'index partiel est **≈ 19,7× plus léger** (24 576 vs 483 328 octets) puisqu'il ne référence que les 254
+documents `type: "series"` au lieu des 23 539 documents de la collection.
