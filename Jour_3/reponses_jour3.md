@@ -138,3 +138,47 @@ vendredi 18h ne peut **absolument pas** rattraper par l'oplog jusqu'au lundi 9h 
 **195 fois** la fenêtre disponible) : l'oplog aurait tourné en boucle des dizaines de fois. Passé ce délai, la
 seule option est une **resynchronisation complète** (initial sync) — copie intégrale des données depuis un autre
 membre, une opération beaucoup plus lourde et longue qu'un simple rattrapage d'oplog.
+
+---
+
+## Partie 2 — Lire et écrire dans un Replica Set
+
+**Q13.**
+```bash
+docker exec mongo2 mongosh --quiet census --eval 'db.zips.countDocuments({})'
+```
+→ **29470** (lecture réussie). `mongosh` moderne, en se connectant **directement** à un membre du set (sans
+`replicaSet=` dans l'URI), n'applique plus le garde-fou client historique qui bloquait les lectures sur un
+secondary tant que `rs.secondaryOk()` (anciennement `slaveOk()`) n'avait pas été appelé explicitement : une
+connexion directe est traitée comme une connexion à une base autonome, la restriction de lecture est déléguée au
+comportement serveur plutôt qu'imposée côté client.
+
+**Q14.**
+```bash
+docker exec mongo2 mongosh --quiet census --eval 'db.zips.insertOne({ test: 1 })'
+```
+→ `codeName: "NotWritablePrimary"`, message `"not primary"`. MongoDB autorise la lecture (le secondary a des
+données à jour ou proches) mais refuse toute écriture car **seul le primary** peut produire des entrées d'oplog
+faisant autorité — laisser un secondary écrire créerait deux sources de vérité divergentes.
+
+**Q15.**
+```js
+rs.printSecondaryReplicationInfo()
+```
+→ Avant : `replLag: '0 secs'` pour mongo2 et mongo3. Après insertion de 1000 documents dans `census.charge` :
+toujours `replLag: '0 secs'` pour les deux. Sur ce cluster local (réseau quasi instantané, faible volume), le
+retard reste imperceptible à cette granularité — ce qui **ne contredit pas** le caractère asynchrone de la
+réplication : rien ne garantit ce délai nul, c'est simplement que les conditions locales (latence réseau
+minimale, faible charge) le rendent non mesurable ici. Le mécanisme reste fondamentalement asynchrone (le primary
+acquitte l'écriture avant confirmation des secondaries en `w:1`).
+
+**Q16.**
+```js
+db.getMongo().setReadPref("primary");   db.zips.countDocuments({ state: "NY" })   // 1596
+db.getMongo().setReadPref("secondary"); db.zips.countDocuments({ state: "NY" })   // 1596
+```
+Résultat identique ici (pas de retard mesurable, cf. Q15). Cas où lire sur un secondary est acceptable : un
+tableau de bord analytique agrégé, rafraîchi périodiquement, où quelques millisecondes/secondes de retard sont
+sans conséquence. Cas dangereux : afficher le solde d'un compte ou le statut d'une commande juste après
+l'écriture — une lecture *stale* sur un secondary en retard pourrait montrer une valeur périmée à l'utilisateur
+qui vient de la modifier lui-même.
