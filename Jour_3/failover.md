@@ -103,3 +103,18 @@ nécessiterait d'attendre l'expiration du heartbeat comme en Q21).
 opérationnel. Perdre 2 nœuds ne laisse qu'1 survivant = pas la majorité → plus aucune écriture possible. Un set de
 **4 nœuds** a besoin de 3 voix pour la majorité ; perdre 2 nœuds ne laisse que 2 survivants = **toujours pas la
 majorité** — un 4ᵉ nœud ne protège donc pas mieux contre 2 pannes simultanées.
+
+## R3 remesure — `electionTimeoutMillis` abaissé à 2000 ms
+
+```js
+var cfg = rs.conf(); cfg.settings.electionTimeoutMillis = 2000; rs.reconfig(cfg)
+```
+Nouveau `docker kill mongo1`, watcher relancé :
+```
+KILL_TIME: 10:50:28.319946200
+[10:50:18.570] (+   0.03s) primary = mongo1:27017
+[10:50:29.156] (+  10.62s) primary = mongo2:27017
+```
+Délai = 10:50:29.156 − 10:50:28.320 = **0,837 s** (contre 9,347 s avec le réglage par défaut de 10 000 ms).
+Valeur d'origine restaurée immédiatement après la mesure (`electionTimeoutMillis = 10000`). Analyse complète dans
+`reponses_jour3.md` (R3).

@@ -291,3 +291,74 @@ Voir [`resilience.md`](resilience.md) pour le détail complet (Q29 à Q33), avec
 - **Q33** : succès du script et `count_documents` **coïncident exactement** (31=31, puis 20=20 avec
   `w:"majority"`) — aucune écriture confirmée n'a été perdue dans ces scénarios.
 
+---
+
+## Partie 6 — Réflexion
+
+**R1. Le collègue qui veut un 4ᵉ nœud.**
+
+Vérifié expérimentalement : un set à **4 nœuds** avec **2 pannes simultanées** (`docker stop` sur 2 des 4)
+refuse toujours l'écriture (`codeName: "NotWritablePrimary"`), **exactement comme** un set à 3 nœuds avec 2 pannes
+(Q23). La majorité d'un set de 4 est **3** voix ; il n'en reste que 2 après 2 pannes — pas la majorité. Réponse au
+collègue : *« Passer à 4 nœuds ne protège pas mieux contre 2 pannes simultanées — la majorité passe de 2 à 3, donc
+la marge de tolérance reste d'exactement 1 panne. »* Si le budget ne permet que 4 machines, je proposerais plutôt
+un **5ᵉ nœud logique** (par exemple un membre `arbiter` sans données, ou répartir les 4 machines en 3 nœuds de
+données + 1 nœud de secours froid) pour obtenir un nombre **impair** de votants et effectivement gagner une
+tolérance à 2 pannes (majorité de 5 = 3, tolère 2 pannes).
+
+**R2. Deux problèmes, deux réponses.**
+
+La **réplication** répond à *« comment continuer à servir les requêtes si une machine tombe ? »* (haute
+disponibilité, copies identiques des mêmes données). Le **sharding** (vu demain) répond à *« comment stocker et
+interroger un volume de données ou un débit d'écriture qui dépasse ce qu'une seule machine peut gérer ? »*
+(scalabilité horizontale, partition des données). En repartant de la Q23(c) (majorité = tolère 1 panne sur 3),
+un cluster shardé de production à 3 shards nécessite, par shard répliqué en 3 nœuds : 3 shards × 3 nœuds = **9
+mongod**, plus un **config server replica set** (3 nœuds supplémentaires pour la même raison de tolérance aux
+pannes) = **3 mongod**, plus au moins **1-2 routeurs `mongos`** (sans données, sans besoin de réplication propre,
+mais dupliqués pour la disponibilité côté applicatif) → un cluster de production réaliste tourne autour de **15
+processus mongod/mongos** au minimum. Un cluster shardé dont les shards **ne seraient pas répliqués** serait plus
+fragile qu'un simple Replica Set : la perte d'**une seule machine** ferait perdre l'accès à **toute une portion**
+des données (le shard entier, indisponible en écriture et lecture), alors qu'un Replica Set simple, lui, tolère
+la perte d'un nœud sur trois sans aucune interruption (Q17-Q21) — le sharding sans réplication multiplie le
+nombre de points de défaillance uniques au lieu de les supprimer.
+
+**R3. Régler le curseur — expérience obligatoire.**
+
+Voir le détail dans [`failover.md`](failover.md), section « R3 remesure ». Délais mesurés : **9,347 s** avec
+`electionTimeoutMillis = 10000`, **0,837 s** avec `electionTimeoutMillis = 2000`.
+
+(a) Rapport : 9,347 / 0,837 ≈ **11,2×** — **pas** 5× comme le suggérerait naïvement le rapport des deux réglages
+(10000/2000 = 5). Explication : une fois `electionTimeoutMillis` ramené à la valeur de `heartbeatIntervalMillis`
+(2000 ms), presque **tout** heartbeat manqué déclenche immédiatement le timeout — le délai n'est plus dominé par
+une longue attente proportionnelle au réglage, mais s'approche d'un plancher lié aux mécanismes d'élection
+eux-mêmes (aller-retours réseau du vote), qui ne rétrécit pas proportionnellement au timeout choisi.
+
+(b) Risque d'un timeout trop bas : un simple **hoquet réseau de quelques secondes** (le cas cité : 3 s) sur un
+cluster distant (pas ce cluster local en Docker) déclencherait une élection **inutile** dès que le hoquet dépasse
+le timeout — alors que le primary est en réalité toujours vivant. Chaque élection non nécessaire interrompt
+brièvement les écritures (quelques centaines de ms à quelques secondes) et peut, en cas de réseau instable,
+provoquer des **élections en cascade** (le primary légitime reprend son rôle, retombe, etc.), dégradant la
+disponibilité au lieu de l'améliorer.
+
+(c) Valeur d'origine restaurée (10000 ms). Je recommanderais de **conserver la valeur par défaut (10 s)** pour ce
+cluster : le gain mesuré (~8,5 s récupérés par bascule) ne compense pas, sur un réseau de production réel
+(latences et micro-coupures bien plus fréquentes qu'en local Docker), le risque d'élections intempestives
+documenté en (b). Un abaissement modéré (par ex. 5000 ms) pourrait se justifier **seulement** après avoir mesuré
+la stabilité réseau réelle de l'environnement de production sur plusieurs semaines.
+
+**R4. Le chiffre honnête.**
+
+Phrase pour la DSI : *« En cas de panne brutale d'une machine, le service est indisponible en écriture pendant
+environ 9 à 10 secondes (9,347 s mesurés côté cluster en Q21, ≈10,4 s vus par une application connectée en Q31),
+et aucune écriture confirmée au client n'est perdue dans ce scénario — mais une écriture acquittée en `w: 1`
+peut, dans d'autres circonstances, exister localement sans être confirmée par la majorité (Q26), et serait alors
+vulnérable à un rollback lors d'un futur failover. »*
+
+Annoncer le seul chiffre de la Q21 (le délai d'élection) serait malhonnête pour trois raisons : (1) il mesure ce
+que voit le **cluster**, pas ce que subit réellement une **application** connectée — la Q31 montre un délai
+légèrement supérieur (~10,4 s), le vrai chiffre côté utilisateur ; (2) il ne dit rien du risque de **perte
+silencieuse** d'écriture (Q26) qui dépend du write concern choisi par l'application, un paramètre totalement
+indépendant du délai d'élection ; (3) il a été mesuré **une fois, sur cette machine, à cet instant** (l'énoncé le
+répète : ces chiffres ne sont identiques à ceux de personne d'autre) — le présenter comme une garantie contractuelle
+sans marge ni condition serait trompeur.
+
