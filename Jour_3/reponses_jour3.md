@@ -362,3 +362,133 @@ indépendant du délai d'élection ; (3) il a été mesuré **une fois, sur cett
 répète : ces chiffres ne sont identiques à ceux de personne d'autre) — le présenter comme une garantie contractuelle
 sans marge ni condition serait trompeur.
 
+---
+
+## Pour aller plus loin (facultatif)
+
+**B1. L'arbitre et le faux sentiment de sécurité.**
+```js
+rs.addArb("mongo-arb:27017")
+```
+Premier obstacle réel : `MongoServerError: Reconfig attempted to install a config that would change the implicit
+default write concern.` — ajouter un membre change la parité du set, MongoDB refuse tant qu'un write concern par
+défaut explicite n'est pas fixé :
+```js
+db.adminCommand({ setDefaultRWConcern: 1, defaultWriteConcern: { w: "majority" } })
+```
+Après quoi `rs.addArb()` réussit. Données stockées par l'arbitre : **aucune** — une requête directe dessus échoue
+avec `"node is not in primary or recovering state"`, y compris pour une simple lecture ; c'est un pur porteur de
+vote, jamais de données.
+
+Le piège : sur ce set **Primary + 2 Secondary + Arbiter** (4 votants, majorité = 3), `docker stop` sur **un seul**
+secondary, puis :
+```js
+db.piege.insertOne({ a: 1 }, { writeConcern: { w: "majority", wtimeout: 5000 } })
+```
+→ `codeName: "WriteConcernFailed", message: "waiting for replication timed out"`, après le plein délai
+(**5050 ms**) — alors que `db.hello().isWritablePrimary` vaut **`true`** : le primary est bien élu, se déclare en
+bonne santé, et pourtant l'écriture majoritaire échoue. Explication : il ne reste que **2 membres porteurs de
+données** (le primary et l'unique secondary restant) sur les 4 votants ; l'arbitre compte pour le quorum
+d'élection mais ne peut **jamais** accuser réception d'une donnée qu'il ne stocke pas. Un `w:"majority"` exige 3
+accusés de réception sur 4 votants — structurellement impossible avec seulement 2 porteurs de données vivants.
+C'est exactement la raison pour laquelle MongoDB déconseille les arbitres : ils améliorent le taux de disponibilité
+des **élections**, jamais la capacité réelle à confirmer une écriture.
+
+**B2. Le membre caché et le membre retardé.**
+```js
+var cfg = rs.conf();
+cfg.members[2].hidden = true;
+cfg.members[2].priority = 0;
+rs.reconfig(cfg);
+```
+Vérifié : `db.hello().hosts` ne liste plus que `['mongo1:27017', 'mongo2:27017']` — mongo3 a disparu de la
+découverte de topologie côté client, bien qu'il continue de répliquer normalement.
+
+```js
+cfg.members[2].secondaryDelaySecs = 60;
+rs.reconfig(cfg);
+```
+Un document daté est inséré sur le primary à **14:46:28** (UTC), puis mongo3 est interrogé toutes les 10 s :
+présent nulle part jusqu'à **14:47:29** (+61 s, absent), apparaît entre cette mesure et **14:47:39** (+71 s,
+présent) — délai réel mesuré dans la fenêtre **[61 s, 71 s]**, cohérent avec les 60 s configurés (résolution de
+mesure limitée par le pas de 10 s). Un membre retardé sert de **filet de rattrapage contre les erreurs
+applicatives** : un `deleteMany` ou une migration ratée se réplique aussi vers les secondaries normaux en quelques
+millisecondes — un backup pris la veille au soir ne suffit pas toujours à revenir juste avant la catastrophe, alors
+qu'un membre retardé de plusieurs heures offre une fenêtre de restauration bien plus large qu'un simple oplog
+(cf. Q12) ou qu'un backup ponctuel.
+
+**B3. Authentifier le Replica Set.**
+```bash
+openssl rand -base64 756 > mongo-keyfile
+```
+**Première erreur rencontrée**, en montant le fichier directement via un bind-mount Windows (`docker run -v
+"$(pwd)/mongo-keyfile:/etc/mongo-keyfile" ...`) :
+```
+"Read security file failed","attr":{"error":{"code":30,"codeName":"InvalidPath",
+"errmsg":"permissions on /etc/mongo-keyfile are too open"}}
+"Error creating service context","attr":{"error":"Location5579201: Unable to acquire security key[s]"}
+```
+Le bind-mount Windows→Docker Desktop ne préserve pas le `chmod 400` posé côté hôte — le fichier apparaît trop
+ouvert côté conteneur Linux quoi qu'on fasse côté NTFS. Correction : copier le fichier **dans** le conteneur
+(`docker cp`) puis fixer les droits **à l'intérieur** (`chmod 400` + `chown mongodb:mongodb`), où les permissions
+Unix sont, elles, honorées normalement.
+
+**Seconde erreur**, isolée volontairement pour la documenter (permissions correctes, mais propriétaire `root` au
+lieu de `mongodb`) :
+```
+"Read security file failed","attr":{"error":{"code":30,"codeName":"InvalidPath",
+"errmsg":"error opening file: /etc/mongo-keyfile: bad file"}}
+```
+Même mode `400`, message différent (`"bad file"` plutôt que `"too open"`) : le fichier est illisible pour
+l'utilisateur `mongodb` qui exécute réellement `mongod` dans le conteneur — la permission Unix `400` restreint la
+lecture au seul propriétaire, et ce propriétaire n'est pas le bon. Les deux erreurs se ressemblent (même
+`codeName`, même échec fatal `"Unable to acquire security key[s]"`) mais ont des causes disjointes : l'une est une
+question de **mode**, l'autre de **propriétaire** — corriger l'une sans l'autre échoue toujours.
+
+Une fois les 3 nœuds relancés avec `--keyFile /etc/mongo-keyfile --auth`, `rs.initiate()` fonctionne encore sans
+authentification (exception localhost, le temps de créer le premier utilisateur) :
+```js
+db.getSiblingDB("admin").createUser({ user: "admin", pwd: "ipssi2025", roles: [{ role: "root", db: "admin" }] })
+```
+Vérification immédiate : sans identifiants, `db.adminCommand({ listDatabases: 1 })` renvoie
+`codeName: "Unauthorized", message: "Command listDatabases requires authentication"` ; avec
+`-u admin -p ipssi2025 --authenticationDatabase admin`, toutes les commandes (y compris `rs.status()`)
+fonctionnent normalement.
+
+**B4. Le rollback, en vrai.** Sur un cluster fraîchement réinitialisé (mongo1 PRIMARY), isolation réseau puis
+écriture immédiate en `w: 1` :
+```bash
+docker network disconnect rslab_default mongo1
+```
+```js
+db.rollbacktest.insertOne({ marker: "w1-orphan", insertedAt: new Date() }, { writeConcern: { w: 1 } })
+// → { acknowledged: true, insertedId: ObjectId('6a8f01916856017cd630de3b') }
+```
+L'écriture réussit **localement** sur mongo1 (aucune confirmation requise en `w:1`) alors qu'il est déjà coupé du
+reste du set. 15 s plus tard, vu depuis mongo2 : `mongo1:27017 (not reachable/healthy) health=0` et **mongo3 est
+devenu PRIMARY** — la majorité (mongo2 + mongo3) a élu un nouveau primary sans mongo1. Fait notable : mongo1
+lui-même s'est déjà rétrogradé de son côté (`isWritablePrimary: false`, `myState: 2`) avant même la reconnexion —
+il a détecté seul qu'il ne pouvait plus joindre de majorité.
+
+Reconnexion :
+```bash
+docker network connect rslab_default mongo1
+```
+Après resynchronisation (~10 s), mongo1 est **SECONDARY** sous l'autorité de mongo3, et le document a
+**disparu** :
+```js
+db.rollbacktest.find({ marker: "w1-orphan" }).toArray()   // → []
+```
+Le fichier de rollback est retrouvé exactement à l'horodatage de la reconnexion :
+```bash
+docker exec mongo1 find /data/db -path "*rollback*"
+# /data/db/rollback/af1db1dd-2410-4c33-9012-3d2b412470d0/removed.2026-08-26T15-09-39.0.bson
+```
+Son contenu (`bsondump`) est **exactement** le document disparu, `_id` identique :
+```json
+{"_id":{"$oid":"6a8f01916856017cd630de3b"},"marker":"w1-orphan","insertedAt":{"$date":{"$numberLong":"1787756945340"}}}
+```
+Preuve complète et bouclée : une écriture acquittée au client en `w: 1` (Q24) a bien été **silencieusement
+annulée** après un changement de primary, exactement le risque décrit en R4 pour justifier de ne jamais annoncer un
+chiffre de disponibilité sans mentionner le write concern utilisé.
+
