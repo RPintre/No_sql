@@ -69,3 +69,72 @@ db.zips.countDocuments({ pop: 0 })   // 67
 67 documents. Un code postal à 0 habitant est plausible en réalité métier (zone industrielle, base militaire,
 boîte postale collective, parc naturel) — ce n'est pas nécessairement une erreur de saisie, mais mérite d'être
 signalé si ces zips sont utilisés dans un calcul de densité de population.
+
+---
+
+## Partie 1 — Anatomie du Replica Set et de l'oplog
+
+**Q6.**
+```js
+rs.conf().settings
+```
+→ `electionTimeoutMillis: 10000`, `heartbeatIntervalMillis: 2000`. « Un secondary déclare le primary mort au bout
+de **10 secondes** sans réponse, alors qu'il l'interroge toutes les **2 secondes**. »
+
+**Q7.**
+```js
+rs.status().members
+```
+→ `mongo1 PRIMARY health=1 lastHeartbeat=undefined` (un primary ne s'auto-heartbeat pas), `mongo2 SECONDARY
+health=1 lastHeartbeat=<horodatage>`, `mongo3 SECONDARY health=1 lastHeartbeat=<horodatage>`. En production, c'est
+le champ **`health`** (0 ou 1) qui signale directement un nœud injoignable — `stateStr` peut afficher un état
+figé pendant un court instant, `health` bascule dès l'échec du dernier heartbeat.
+
+**Q8.**
+```js
+db.getSiblingDB("local").oplog.rs.stats().maxSize   // 134217728
+```
+= exactement **128 Mo** (134217728 = 128×1024×1024), fixé explicitement par `--oplogSize 128` dans
+`docker-compose.rs.yml`. Sans cette valeur, MongoDB calcule une taille par défaut (habituellement ~5 % de l'espace
+disque libre, avec un plancher), ce qui rendrait le dimensionnement imprévisible et non reproductible d'une
+machine à l'autre — exactement ce que ce TP veut éviter.
+
+**Q9.**
+```js
+db.getSiblingDB("local").oplog.rs.countDocuments({ op: "i", ns: "census.zips" })   // 29470
+```
+Égalité exacte avec les 29470 documents importés : la réplication opère à la granularité du **document
+individuel**, jamais par lot — même si `mongoimport` envoie ses données en lots réseau de plusieurs milliers de
+documents, l'oplog contient une entrée par document inséré.
+
+**Q10.**
+```js
+db.getSiblingDB("local").oplog.rs.findOne({ op: "i", ns: "census.zips" })
+```
+→ `op: "i"`, `ns: "census.zips"`, `o`: le **document complet** inséré, `ts`: l'horodatage logique (Timestamp),
+`wall`: l'horodatage mur. Le champ `o` contient le document entier (pas un delta) : rejouer deux fois « insère ce
+document précis » produit le même état final (le serveur applique l'opération comme un remplacement basé sur
+`_id`), ce qui rend l'opération idempotente.
+
+**Q11.**
+```js
+db.zips.updateMany({ state: "TX" }, { $inc: { pop: 1 } })
+// matchedCount: 1676, modifiedCount: 1676
+db.getSiblingDB("local").oplog.rs.findOne({ op: "u", ns: "census.zips" })
+```
+→ `o: { '$v': 2, diff: { u: { pop: 40833 } } }`. **Pas de `$inc`** dans l'oplog : MongoDB y stocke la **valeur
+finale calculée** (40833), jamais l'opérateur relatif. Un `$inc` rejoué deux fois incrémenterait deux fois — en
+stockant le résultat absolu, l'oplog reste idempotent quel que soit le nombre de fois où l'entrée est rejouée,
+exactement pour la même raison qu'en Q10.
+
+**Q12.**
+```js
+db.getSiblingDB("local").oplog.rs.stats()   // size: 12020202, count: 31185
+```
+(a) Taille moyenne : 12020202 / 31185 = **385,45 octets/opération**.
+(b) Capacité : 134217728 / 385,45 ≈ **348212 opérations** avant écrasement des plus anciennes.
+(c) À 300 écritures/s : 348212 / 300 ≈ **1160,7 s ≈ 19,35 minutes** de fenêtre de réplication. Un secondary tombé
+vendredi 18h ne peut **absolument pas** rattraper par l'oplog jusqu'au lundi 9h (écart de 63 heures, soit plus de
+**195 fois** la fenêtre disponible) : l'oplog aurait tourné en boucle des dizaines de fois. Passé ce délai, la
+seule option est une **resynchronisation complète** (initial sync) — copie intégrale des données depuis un autre
+membre, une opération beaucoup plus lourde et longue qu'un simple rattrapage d'oplog.
