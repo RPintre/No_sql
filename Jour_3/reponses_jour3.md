@@ -271,3 +271,23 @@ majorité — exactement le cas du document `c` de la Q26, visible localement su
 majorité. Pour un utilisateur final, `"majority"` garantit qu'une donnée lue ne « disparaîtra » jamais après coup ;
 `"local"` peut, dans de rares cas de bascule, faire lire une donnée qui sera ensuite annulée.
 
+---
+
+## Partie 5 — Résilience applicative
+
+Voir [`resilience.md`](resilience.md) pour le détail complet (Q29 à Q33), avec les sorties brutes horodatées de
+`writer.py` et le tableau retryWrites.
+
+**Résumé** :
+- **Q29** : `ServerSelectionTimeoutError` réel et intégral reproduit ; la cause est la **découverte automatique de
+  topologie** (pas le paramètre `?replicaSet=`) ; `directConnection=true` la désactive (`topology_type_name:
+  "Single"`, `client.primary: None`).
+- **Q30** : lancé dans `rslab_default`, l'app voit `primary=('mongo1', 27017)` dès la première ligne.
+- **Q31** : kill du primary pendant l'écriture → **1 seul échec** sur 32 tentatives, indisponibilité applicative
+  ≈ **10,4 s** (contre 9,347 s mesurés côté cluster en Q21), reconnexion automatique sans intervention.
+- **Q32** : `retryWrites` ne change rien face à un `kill` (écart nul, même exception) car il n'y a personne à qui
+  reparler pendant l'absence de primary ; face à un `rs.stepDown()` en écriture rapprochée, l'écart est **net** :
+  0 échec sur 271 écritures avec `retryWrites=true`, contre 1 échec sur 249 avec `retryWrites=false`.
+- **Q33** : succès du script et `count_documents` **coïncident exactement** (31=31, puis 20=20 avec
+  `w:"majority"`) — aucune écriture confirmée n'a été perdue dans ces scénarios.
+
