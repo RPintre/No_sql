@@ -182,3 +182,26 @@ tableau de bord analytique agrégé, rafraîchi périodiquement, où quelques mi
 sans conséquence. Cas dangereux : afficher le solde d'un compte ou le statut d'une commande juste après
 l'écriture — une lecture *stale* sur un secondary en retard pourrait montrer une valeur périmée à l'utilisateur
 qui vient de la modifier lui-même.
+
+---
+
+## Partie 3 — Failover : provoquer la panne et la chronométrer
+
+Voir [`failover.md`](failover.md) pour le détail complet des commandes, sorties brutes et mesures (Q17 à Q23),
+et le tableau de synthèse demandé en Q22.
+
+**Résumé** :
+- **Q17-Q18** : arrêt propre → nouveau primary (mongo2) en **0,20 s** ; `mongo1` apparaît `(not
+  reachable/healthy)`, `health: 0`, vu depuis mongo2.
+- **Q19-Q20** : mongo1 revient en SECONDARY, reprend PRIMARY par *priority takeover* en **11,78 s** ; 2 bascules
+  au total depuis le `docker stop`. Une expérience dédiée prouve la resynchronisation par oplog (document inséré
+  pendant l'absence de mongo1, retrouvé sur mongo1 à son retour).
+- **Q21** : panne brutale (`docker kill`) → nouveau primary (mongo3) en **9,347 s**, soit **47× plus lent** que
+  l'arrêt propre ; délai légèrement inférieur à `electionTimeoutMillis` (10 s) car le compte à rebours démarre au
+  dernier heartbeat réussi, pas à l'instant du kill.
+- **Q22** : tableau de synthèse dans `failover.md`.
+- **Q23** : en isolant le PRIMARY (2 nœuds sur 3 arrêtés), il se rétrograde en SECONDARY plus vite que je n'ai pu
+  le mesurer manuellement (les deux relevés, immédiat et +15s, sont identiques) ; écriture refusée
+  (`NotWritablePrimary`), lecture toujours acceptée. Une majorité de 3 = 2 voix ; en perdre 2 ne laisse qu'1
+  survivant, jamais la majorité — et un 4ᵉ nœud (majorité = 3) ne tolère pas mieux 2 pannes simultanées (2
+  survivants sur 4 ≠ majorité).
