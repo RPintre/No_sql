@@ -205,3 +205,69 @@ et le tableau de synthèse demandé en Q22.
   (`NotWritablePrimary`), lecture toujours acceptée. Une majorité de 3 = 2 voix ; en perdre 2 ne laisse qu'1
   survivant, jamais la majorité — et un 4ᵉ nœud (majorité = 3) ne tolère pas mieux 2 pannes simultanées (2
   survivants sur 4 ≠ majorité).
+
+---
+
+## Partie 4 — Write Concern & Read Concern
+
+**Q24.**
+```js
+db.demo.insertOne({ a: 1 }, { writeConcern: { w: 1 } })          // succès
+db.demo.insertOne({ a2: 1 }, { writeConcern: { w: "majority" } }) // succès
+```
+`w: 1` garantit seulement que le **primary** a écrit en mémoire (pas encore forcément répliqué) ; `w: "majority"`
+garantit qu'une **majorité des nœuds** a l'écriture. Dans le scénario de panne brutale de la Q21, une écriture en
+`w: 1` juste avant le kill aurait pu être acquittée au client puis **perdue** si le primary tombe avant d'avoir
+répliqué vers un secondary (rollback potentiel après réélection).
+
+**Q25.**
+```js
+db.demo.insertOne({ a: 1 }, { writeConcern: { w: 4, wtimeout: 3000 } })
+```
+→ `codeName: "UnsatisfiableWriteConcern"`, message **"Not enough data-bearing nodes"**, en **3 ms** — pas 3000 ms.
+MongoDB valide `w` par rapport à la topologie connue (3 nœuds data-bearing) **avant** de commencer à attendre :
+`w: 4` est structurellement impossible, inutile d'attendre un timeout pour un cas qui ne peut jamais réussir.
+
+**Q26.** (`docker stop mongo3`, un secondary, avant le test)
+
+(a)
+```js
+db.demo.insertOne({ b: 1 }, { writeConcern: { w: "majority", wtimeout: 3000 } })  // succès, 11 ms
+db.demo.insertOne({ c: 1 }, { writeConcern: { w: 3, wtimeout: 3000 } })
+// → codeName: "WriteConcernFailed", message: "waiting for replication timed out", 3017 ms
+```
+`w: "majority"` passe (2 nœuds sur 3 = majorité, mongo3 non requis) ; `w: 3` échoue après le plein `wtimeout` de
+3 s (il faut littéralement les 3 nœuds).
+
+(b)
+```js
+db.demo.countDocuments({})   // 5
+```
+5 documents trouvés (`a`, `a2`, `b`, et **deux fois** `a` — dont un du test Q25 — plus `c`), alors qu'un échec
+« rien n'a été écrit » n'en attendait que 3 (les 3 succès explicites : `w:1`, `w:"majority"` de Q24, `w:"majority"`
+de Q26a). **Écart de 2** : les documents des deux tentatives « échouées » (`w:4` en Q25, `w:3` en Q26a) sont bel
+et bien présents dans la collection.
+
+(c) Un échec de write concern signifie « je n'ai pas pu **confirmer** que l'écriture avait atteint le niveau de
+durabilité demandé dans le temps imparti » — **pas** « l'écriture n'a pas eu lieu ». Le document est écrit
+localement sur le primary dès l'appel, indépendamment du succès de l'acquittement. Une application qui **rejoue**
+l'écriture après avoir reçu cette erreur (en supposant « rien n'a été écrit ») créerait un **doublon**.
+
+**Q27.**
+```js
+db.demo.insertOne({ d: 1 }, { writeConcern: { w: "majority", j: true, wtimeout: 3000 } })
+// succès, 23 ms (contre 11 ms sans j:true)
+```
+`j: true` garantit en plus que l'écriture a été **journalisée sur disque** (fsync du journal WiredTiger) sur les
+nœuds comptés dans `w`, pas seulement acquittée en mémoire — au prix d'une latence légèrement supérieure (23 ms
+contre 11 ms ici). Sans `j: true`, si les 3 machines perdaient le courant **simultanément** avant le prochain
+flush du journal, une écriture acquittée en `w:"majority"` mais non journalisée pourrait être perdue sur
+redémarrage ; avec `j: true`, elle survit à cette coupure totale.
+
+**Q28.** `readConcern: "majority"` ne renvoie que des données qu'une **majorité** du set a confirmées — des
+données qui ne peuvent plus être annulées par un rollback après un futur failover. `readConcern: "local"` (le
+défaut) renvoie l'état local du nœud interrogé, qui peut inclure des écritures pas encore confirmées par la
+majorité — exactement le cas du document `c` de la Q26, visible localement sur le primary sans être acquitté en
+majorité. Pour un utilisateur final, `"majority"` garantit qu'une donnée lue ne « disparaîtra » jamais après coup ;
+`"local"` peut, dans de rares cas de bascule, faire lire une donnée qui sera ensuite annulée.
+
