@@ -484,3 +484,96 @@ db.system.profile.find({ planSummary: "COLLSCAN", millis: { $gt: N } })
 ```
 
 isole exactement les opérations qui méritent une indexation prioritaire : lentes **et** en parcours complet.
+
+## Partie C - Réflexion
+
+**R1. Le tableau de bord quotidien.**
+
+Plutôt que de recalculer les agrégations de la Partie B1 à chaque affichage du tableau de bord, on
+matérialise le résultat dans une collection dérivée via `$merge` (comme `stations` en Q24), rafraîchie chaque
+matin à 6h par un job planifié (cron, tâche planifiée MongoDB Atlas, ou simple script appelé par un
+ordonnanceur). Le tableau de bord interroge ensuite uniquement cette petite collection, indexée sur les
+champs consultés, avec le profiler actif en continu (niveau 1, `slowms` bas) pour détecter toute dérive de
+performance.
+
+Chiffrage du gain : la Q23 (agrégation complète sur `trips` sans filtre poussé) fait passer **10000**
+documents dans le `$group`. La collection `stations` dérivée (Q24) ne compte que **462** documents. Rapport :
+10000 / 462 ≈ **21,6** - chaque lecture du tableau de bord coûte environ 21,6 fois moins de documents
+parcourus que de recalculer depuis `trips`. Le compromis accepté : la donnée affichée n'est fraîche qu'à la
+dernière exécution du job de rafraîchissement (potentiellement jusqu'à 24h de retard dans le pire cas), ce
+qui est explicitement acceptable ici puisque la direction ne demande qu'un rafraîchissement quotidien, pas
+temps réel.
+
+**R2. La règle d'écriture des pipelines, vérifiée.**
+
+Règle en trois phrases, à partir des Q22 et Q23 : L'optimiseur d'agrégation peut remonter un `$match` avant
+un `$group` (voire jusque dans le curseur initial) quand ce `$match` porte sur un champ qui reste un simple
+alias traçable d'un champ d'entrée, même à travers un `_id` composé. Il ne peut jamais le faire quand le
+`$match` porte sur une valeur produite par un accumulateur (`$sum`, `$avg`...), puisque cette valeur n'existe
+qu'après l'agrégation complète du groupe. Écrire `$match` en premier reste malgré tout la bonne habitude à
+prendre : dans le meilleur des cas l'optimiseur l'aurait fait à votre place, mais dans le pire cas (Q23) c'est
+la seule façon d'obtenir un filtrage précoce.
+
+Test complémentaire : un troisième pipeline avec un `$project` qui supprime le champ, suivi d'un `$match` sur
+ce même champ :
+
+```js
+db.trips.explain("executionStats").aggregate([{ $project: { usertype: 0 } }, { $match: { usertype: "Subscriber" } }])
+```
+
+L'explain montre deux stages seulement : `$cursor` (qui absorbe le `$project`) puis `$match` - **le `$match`
+n'est pas remonté** cette fois, et le pipeline renvoie **0 résultat**. Ce troisième cas montre la frontière
+exacte de ce que sait faire l'optimiseur : il sait suivre un champ à travers un renommage ou un regroupement
+tant que ce champ existe toujours quelque part dans le document sous une forme traçable, mais dès qu'un
+`$project` supprime purement et simplement le champ, toute référence ultérieure à ce champ ne peut plus être
+retracée jusqu'à la source - le `$match` s'exécute bien, mais contre un champ qui n'existe plus (donc
+`undefined`), ce qui ne produit pas une erreur mais un résultat vide et silencieux. C'est un piège plus
+sournois qu'un simple défaut de performance.
+
+**R3. Le chiffre unique, et son coût.**
+
+(a) Phrase pour le rapport : *"La durée moyenne d'un trajet Citi Bike est de 649 secondes pour les abonnés
+(Subscriber, n = 7998) et de 1718 secondes pour les usagers occasionnels (Customer, n = 1948), les trajets de
+plus de 3 heures (54 sur 10000, soit 0,54 % du jeu) ayant été exclus car ils correspondent à des vélos non
+redockés plutôt qu'à un usage réel."*
+
+(b) Médiane sur le jeu **non filtré** (`$median`, méthode approximée) :
+
+```js
+db.trips.aggregate([{ $group: { _id: null, mediane: { $median: { input: "$tripduration", method: "approximate" } } } }])
+```
+
+Médiane : **578,78 s**. Comparaison avec les moyennes globales (tous usertype confondus, pour une comparaison
+homogène) : moyenne brute non filtrée = 1129,99 s, moyenne filtrée hors >3h = 858,03 s, médiane = 578,78 s.
+
+La **médiane est la valeur la plus robuste** : elle bouge à peine entre le jeu filtré et non filtré (par
+construction, une poignée de valeurs extrêmes ne déplace jamais la valeur centrale d'une distribution),
+tandis que la moyenne brute est gonflée de près de 32 % par rapport à la moyenne déjà filtrée, uniquement à
+cause d'une poignée de trajets de plusieurs dizaines d'heures.
+
+(c) Une réponse sans précaution ne serait pas seulement imprécise, elle serait **malhonnête** : donner la
+moyenne brute (1130 s) sans mentionner qu'elle est tirée vers le haut par 54 trajets clairement aberrants
+(0,54 % du jeu) présente une image fausse de l'usage réel du service à une direction qui va s'en servir pour
+décider - la différence entre "imprécis" et "malhonnête" est que l'imprécision est involontaire, alors
+qu'ici l'anomalie a été détectée et documentée (Q18-Q20) : la taire dans le chiffre final est un choix.
+
+**R4. `explain()` ou profiler ?**
+
+En Q31, `explain()` donne une vision **microscopique et hypothétique** : pour une requête précise que je
+choisis d'écrire, il montre le plan retenu, combien de documents/clés ont été examinés, sans jamais exécuter
+cette requête dans le flux réel de l'application. En Q32, le profiler donne une vision **macroscopique et
+factuelle** : il capture ce qui s'est réellement passé sur la base, sans que j'aie besoin de deviner à
+l'avance quelle requête est fautive - c'est lui qui m'a signalé que `end station name` et l'agrégation sur
+`usertype` tournaient en `COLLSCAN`, alors que je n'aurais pas forcément pensé à tester ces deux-là avec
+`explain()` en premier.
+
+Pour un incident "l'appli est lente depuis 14h" : d'abord les **logs applicatifs** (gratuits, déjà
+disponibles, permettent d'écarter en quelques secondes une cause évidente - erreur de déploiement, panne
+réseau, service tiers en carafe) ; puis **`mongostat`** (quasi gratuit, vue temps réel du serveur - charge
+CPU, IOPS, connexions - permet de savoir si le problème est côté base de données avant d'aller plus loin) ;
+puis le **profiler** (coût modéré si déjà actif en continu au niveau 1 - identifie *quelles* requêtes
+précises sont devenues lentes depuis 14h, sans avoir à les deviner) ; enfin **`explain()`** (le plus ciblé,
+mais suppose de déjà savoir quelle requête regarder - sert à comprendre *pourquoi* elle est lente et à valider
+la correction, par exemple un nouvel index). Cet ordre va du moins coûteux/plus général au plus coûteux/plus
+précis, chaque étape servant à éliminer des hypothèses et à restreindre le périmètre avant d'investir le
+temps nécessaire à un diagnostic fin.
