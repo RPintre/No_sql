@@ -162,6 +162,19 @@ rater un vrai signal qui reviendrait plus tard sous une forme plus grave.
 
 *(Vérification à faire en fin de séance, cluster laissé allumé - voir la suite du rendu.)*
 
+### Vérification (fin de Partie B)
+
+Le cluster shardé est resté allumé pendant toute la Partie B, comme demandé. Nouvelle exécution des deux
+commandes :
+
+```js
+db.zips.countDocuments({})          // 29470
+db.zips.estimatedDocumentCount()    // 29470
+```
+
+Les deux commandes renvoient désormais **le même chiffre, 29470** : l'écart de la question (a) a
+effectivement disparu. La prédiction est confirmée.
+
 ## Q6 / Q7 - Targeted vs broadcast
 
 ```js

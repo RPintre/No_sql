@@ -50,3 +50,437 @@ frontières de chunks, les 3 `explain()` targeted/broadcast et le tableau de dé
 - **Q9** : la même requête `{state:"NY"}` devient broadcast (`SHARD_MERGE`) sur la collection hachée. Le
   compromis : une clé hachée distribue parfaitement l'écriture mais sacrifie tout ciblage de requête sur les
   autres champs. Tableau de décision complet dans `bench_shard.md`.
+
+## Partie B - Performances & diagnostic (citibike.trips)
+
+**Point de contrôle B0.**
+
+```js
+db.trips.countDocuments({})   // 10000
+db.trips.findOne()
+```
+
+Le document affiché confirme des noms de champs contenant des espaces : `start station id`,
+`start station name`, `end station id`, `end station name`, `birth year`.
+
+Le cluster shardé de la Partie A a été laissé allumé pendant tout ce travail. Sa vérification finale (Q5(d))
+est consignée dans `bench_shard.md` : l'écart de comptage a bien disparu après 15 minutes.
+
+**Q10.** Les espaces dans un nom de champ empêchent la notation pointée habituelle (`db.trips.find({start
+station id: 476})` est un JSON invalide, erreur de syntaxe immédiate). Il faut systématiquement encadrer le
+nom de champ entre guillemets :
+
+- (a) filtre `find` : `db.trips.find({ "start station id": 476 })`
+- (b) référence dans un `$group` : `{ $group: { _id: "$start station id", ... } }` (le `$` devant une chaîne
+  entre guillemets reste obligatoire pour désigner un champ dans une expression d'agrégation)
+
+Si on oublie les guillemets, MongoDB (ou le shell JS) interprète `station` et `id` comme des tokens séparés -
+résultat : une erreur de syntaxe à l'analyse (`SyntaxError: Unexpected identifier`), la requête n'est même
+pas envoyée au serveur.
+
+**Q11.**
+
+```js
+db.trips.aggregate([{ $group: { _id: null, debut: { $min: "$start time" }, fin: { $max: "$stop time" } } }])
+```
+
+- `$min` de `start time` : `2016-01-01T00:00:41.000Z`
+- `$max` de `stop time` : `2016-01-02T19:35:22.000Z`
+
+Le jeu s'annonce comme "1er et 2 janvier 2016", ce qui correspond bien à ce qu'on observe : le premier trajet
+commence à 00:00:41 le 1er janvier, et le dernier se termine à 19:35 le 2 janvier - moins de deux jours
+pleins de données, pas un mois entier malgré la mention "janvier 2016" du contexte métier.
+
+**Q12.** Top 5 des stations de départ :
+
+| Station | Trajets |
+|---|---|
+| Central Park S & 6 Ave | 114 |
+| Lafayette St & E 8 St | 99 |
+| Carmine St & 6 Ave | 95 |
+| Broadway & E 14 St | 93 |
+| E 17 St & Broadway | 86 |
+
+**Q13.** Répartition par `usertype` :
+
+| usertype | trajets | durée moyenne |
+|---|---|---|
+| Subscriber | 8011 | 762,36 s |
+| Customer | 1989 | 2610,71 s |
+
+Le rapport est de 2610,71 / 762,36 ≈ **3,42** : un trajet Customer dure en moyenne 3,4 fois plus
+longtemps qu'un trajet Subscriber. Hypothèse métier : les Subscriber sont des abonnés réguliers qui
+utilisent le vélo pour un trajet utilitaire court (domicile-travail, correspondance), tandis que les Customer
+sont des utilisateurs occasionnels (touristes, achat au ticket) qui gardent le vélo plus longtemps, pour une
+balade plutôt qu'un trajet point-à-point.
+
+**Q14.**
+
+```js
+db.trips.aggregate([
+  { $group: { _id: { $dateTrunc: { date: "$start time", unit: "day" } }, n: { $sum: 1 } } },
+  { $sort: { _id: 1 } }
+])
+```
+
+| Jour | Trajets |
+|---|---|
+| 2016-01-01 | 6348 |
+| 2016-01-02 | 3652 |
+
+**2 jours**, ce qui est parfaitement cohérent avec la plage observée en Q11 (du 1er janvier 00h00 au 2 janvier
+19h35).
+
+**Q15.** Top 5 des heures de départ :
+
+| Heure | Trajets |
+|---|---|
+| 13h | 1061 |
+| 12h | 827 |
+| 11h | 778 |
+| 15h | 709 |
+| 14h | 685 |
+
+Ce profil (pic entre 11h et 15h, creux implicite tôt le matin et en soirée) ne ressemble **pas** à un usage
+domicile-travail classique, qui montrerait deux pics nets vers 8h et 17-18h. C'est cohérent avec la date :
+le 1er janvier 2016 était un **vendredi**, jour férié (jour de l'an) - l'essentiel du trafic du jeu (6348 sur
+10000 trajets) vient de ce jour-là, ce qui explique un usage plutôt loisir/tourisme en milieu de journée que
+domicile-travail.
+
+**Q16.**
+
+```js
+db.trips.aggregate([{ $bucket: { groupBy: "$tripduration", boundaries: [0, 300, 600, 1800, 3600, 1000000], output: { n: { $sum: 1 } } } }])
+```
+
+| Tranche (s) | Effectif |
+|---|---|
+| [0, 300) | 2009 |
+| [300, 600) | 3136 |
+| [600, 1800) | 3953 |
+| [1800, 3600) | 652 |
+| [3600, 1000000) | 250 |
+
+La tranche la plus peuplée est **[600, 1800)** (10 à 30 minutes), avec 3953 trajets.
+
+**Q17.**
+
+```js
+db.trips.countDocuments({ $expr: { $eq: ["$start station id", "$end station id"] } })
+```
+
+**316** trajets repartent de la station où ils sont arrivés (boucles). Comparer deux champs du même document
+impose bien `$expr` : un filtre `find` classique (`{ "start station id": "$end station id" }`) comparerait le
+champ à la chaîne littérale `"$end station id"`, pas au champ correspondant.
+
+## Partie B2 - Qualité de données et optimiseur
+
+**Q18.**
+
+```js
+db.trips.countDocuments({ "birth year": { $type: "string" } })   // 1989
+db.trips.countDocuments({ "birth year": { $type: "int" } })      // 8011
+```
+
+Croisé avec `usertype` :
+
+| type de birth year | usertype | n |
+|---|---|---|
+| int | Subscriber | 8011 |
+| string | Customer | 1989 |
+
+La correspondance est exacte et totale : **tous** les Subscriber (8011, le même effectif qu'en Q13) ont un
+`birth year` numérique, et **tous** les Customer (1989, même effectif qu'en Q13) l'ont stocké en chaîne de
+caractères. C'est exactement le piège annoncé en tête du TP : un champ numérique stocké en chaîne sur une
+partie exacte de la population (ici, la totalité des Customer).
+
+Conséquence concrète : une requête `{ "birth year": { $lt: 1950 } }` est **silencieusement fausse**, car un
+comparateur numérique (`$lt`) appliqué à un champ de type chaîne ne matche jamais ce champ en BSON (les
+comparaisons `$lt`/`$gt` respectent l'ordre des types BSON, et `string` n'est pas comparé à `number`) - la
+requête ne renverra jamais aucun Customer, sans la moindre erreur pour le signaler. Un rapport construit sur
+cette requête exclurait purement et simplement 1989 usagers (presque 20 % du jeu) sans que personne ne s'en
+rende compte.
+
+**Q19.**
+
+```js
+db.trips.aggregate([
+  { $match: { "birth year": { $type: "number" } } },
+  { $group: { _id: null, ageMoyen: { $avg: { $subtract: [2016, "$birth year"] } }, n: { $sum: 1 }, naissanceMin: { $min: "$birth year" } } }
+])
+```
+
+- Âge moyen : **39,86 ans**
+- Effectif retenu : **8011** (uniquement les Subscriber, seuls à avoir un `birth year` numérique - voir Q18)
+- Naissance la plus ancienne : **1885**, soit un âge de 131 ans en 2016.
+
+Cette dernière valeur n'est **pas crédible**. En production, ce document mérite d'être signalé et traité à
+part (exclu du calcul d'âge, ou vérifié manuellement) - une valeur par défaut ou une erreur de saisie
+(1985 tapé 1885, ou une valeur sentinelle mal choisie) est bien plus probable qu'un usager centenaire à vélo.
+
+**Q20.**
+
+```js
+db.trips.countDocuments({ tripduration: { $gt: 10800 } })   // > 3h : 54
+db.trips.countDocuments({ tripduration: { $gt: 86400 } })   // > 24h : 9
+```
+
+3 trajets les plus longs :
+
+| tripduration (s) | usertype |
+|---|---|
+| 326222 (~90,6 h) | Subscriber |
+| 279620 (~77,7 h) | Customer |
+| 173357 (~48,2 h) | Customer |
+
+Explication métier probable : un vélo non redocké correctement (rendu dans une station mais le loquet mal
+verrouillé, ou volé puis retrouvé/redéposé plus tard) - le système continue de compter la durée jusqu'au
+retour effectif détecté, produisant des trajets de plusieurs jours qui ne reflètent aucun usage réel.
+
+**Q21.**
+
+```js
+db.trips.aggregate([
+  { $match: { tripduration: { $lte: 10800 } } },
+  { $group: { _id: "$usertype", n: { $sum: 1 }, dureeMoyenne: { $avg: "$tripduration" } } }
+])
+```
+
+### (a) Nouvelles moyennes
+
+| usertype | n (après exclusion) | durée moyenne |
+|---|---|---|
+| Subscriber | 7998 | 648,59 s |
+| Customer | 1948 | 1717,93 s |
+
+### (b) Écart avec la Q13
+
+| usertype | Q13 (brut) | Q21 (filtré) | écart |
+|---|---|---|---|
+| Subscriber | 762,36 s | 648,59 s | -14,9 % |
+| Customer | 2610,71 s | 1717,93 s | -34,2 % |
+
+Les deux populations ne sont **pas** affectées de la même façon : la moyenne Customer chute plus du double
+(en pourcentage) de celle des Subscriber. C'est cohérent avec la répartition des exclusions ci-dessous : les
+trajets aberrants touchent bien plus les Customer, en proportion, que les Subscriber.
+
+### (c) Trajets exclus
+
+54 trajets exclus au total (0,54 % du jeu de 10000), répartis ainsi :
+
+| usertype | trajets exclus |
+|---|---|
+| Customer | 41 |
+| Subscriber | 13 |
+
+41 exclusions sur 1989 Customer (2,06 %) contre 13 sur 8011 Subscriber (0,16 %) : les valeurs aberrantes sont
+environ 13 fois plus fréquentes chez les Customer, proportionnellement - ce qui explique directement pourquoi
+leur moyenne bouge tellement plus en (b) : une poignée de trajets de plusieurs dizaines d'heures pèse
+beaucoup plus lourd sur une moyenne quand la population de base est petite (1989) que quand elle est grande
+(8011).
+
+### (d) Quelle valeur communiquer
+
+La valeur **filtrée (Q21)** est la plus honnête à communiquer à la direction : la valeur brute (Q13) est
+tirée vers le haut par une poignée de trajets clairement anormaux (vélos non redockés plusieurs jours), qui
+ne représentent aucun usage réel du service. À condition de le documenter explicitement (voir R3).
+
+**Q22.** Deux pipelines qui renvoient le même résultat :
+
+```js
+// A
+[ { $match: { usertype: "Subscriber" } }, { $group: { _id: "$start station id", n: { $sum: 1 } } } ]
+// B
+[ { $group: { _id: { s: "$start station id", u: "$usertype" }, n: { $sum: 1 } } }, { $match: { "_id.u": "Subscriber" } } ]
+```
+
+`db.trips.explain("executionStats").aggregate([...])` sur les deux :
+
+| | Pipeline A | Pipeline B |
+|---|---|---|
+| totalDocsExamined (étage `$cursor`) | 10000 | 10000 |
+| nReturned du `$cursor` | 8011 | 8011 |
+| nReturned final (`$group`) | 459 | 459 |
+
+**Les deux plans sont identiques.** C'est le résultat intéressant de cette question : bien que `$match` soit
+écrit *après* `$group` dans le pipeline B, l'explain montre que MongoDB a quand même réussi à remonter le
+filtre `{ "_id.u": "Subscriber" }` jusque dans le `$cursor` initial (`parsedQuery: { usertype: { $eq:
+"Subscriber" } }`), exactement comme pour le pipeline A. L'optimiseur (« aggregation pipeline optimization »)
+sait reconnaître qu'ici `_id.u` n'est qu'un **simple alias** direct du champ source `$usertype` (pas une
+valeur calculée), et il retrace cette filiation à travers le `$group` pour réécrire le filtre en amont, avant
+même que les documents n'entrent dans le pipeline. Concrètement : écrire le `$match` en premier n'a fait ici
+aucune différence mesurable, car l'optimiseur l'aurait remonté de toute façon.
+
+**Q23.**
+
+```js
+[ { $group: { _id: "$start station id", n: { $sum: 1 } } }, { $match: { n: { $gt: 50 } } } ]
+```
+
+Ici, **10000 documents** traversent le `$group` (contre 8011 dans le `$cursor` de la Q22) : l'optimiseur ne
+peut absolument rien pousser en amont. La raison est structurelle et non une limite d'implémentation : `n`
+n'existe pas avant que `$group` ait fini son travail - c'est le résultat d'un accumulateur (`$sum`) calculé
+en agrégeant tous les documents d'un groupe, donc sa valeur ne peut logiquement être connue qu'après le
+`$group` complet. Contrairement à la Q22 où `_id.u` était un alias direct et retraçable jusqu'à un champ
+source, `n` est une valeur dérivée : il n'y a rien à retracer.
+
+**34 stations** dépassent 50 départs.
+
+**Règle générale** : l'optimiseur ne peut remonter un `$match` avant un `$group` que s'il porte sur un champ
+qui est un **alias direct** d'un champ d'entrée (via `_id` ou un champ passé tel quel) ; il ne peut jamais le
+faire si le `$match` porte sur le résultat d'un accumulateur (`$sum`, `$avg`, `$count`, etc.), car cette
+valeur n'existe qu'après l'agrégation complète des documents du groupe.
+
+## Partie B3 - Matérialisation et jointure
+
+**Q24.**
+
+```js
+db.trips.aggregate([
+  { $group: { _id: "$start station id", nom: { $first: "$start station name" }, position: { $first: "$start station location" }, departs: { $sum: 1 } } },
+  { $merge: { into: "stations", whenMatched: "replace" } }
+])
+```
+
+**462 stations.** Les 3 premières par nombre de départs :
+
+| Station | Départs |
+|---|---|
+| Central Park S & 6 Ave | 114 |
+| Lafayette St & E 8 St | 99 |
+| Carmine St & 6 Ave | 95 |
+
+(sans surprise, identique au top des départs de la Q12 : `stations` est directement dérivée de `trips`).
+
+**Q25.** `$out` remplace **intégralement** la collection cible à chaque exécution (elle est effacée puis
+recréée) ; `$merge` peut fusionner de façon incrémentale, document par document, selon une clé de
+correspondance (`whenMatched`, `whenNotMatched`). Pour un rafraîchissement quotidien du tableau de bord, c'est
+**`$merge`** qu'il faut utiliser : il permet de ne recalculer et remplacer que les documents concernés (par
+exemple, ne traiter que les stations actives dans les nouveaux trajets du jour), sans avoir à reconstruire
+toute la collection à chaque fois, et sans laisser la collection vide le temps du recalcul comme le ferait
+`$out`.
+
+**Q26.**
+
+```js
+db.trips.aggregate([
+  { $group: { _id: "$end station id", n: { $sum: 1 } } },
+  { $sort: { n: -1 } }, { $limit: 5 },
+  { $lookup: { from: "stations", localField: "_id", foreignField: "_id", as: "info" } },
+  { $unwind: "$info" },
+  { $project: { _id: 1, nom: "$info.nom", n: 1 } }
+])
+```
+
+| Station (arrivée) | Arrivées |
+|---|---|
+| E 17 St & Broadway | 96 |
+| Central Park S & 6 Ave | 95 |
+| Broadway & E 14 St | 91 |
+| W 21 St & 6 Ave | 85 |
+| West St & Chambers St | 85 |
+
+Comparaison avec le top des départs (Q12) : **Central Park S & 6 Ave**, **Broadway & E 14 St** et
+**E 17 St & Broadway** apparaissent dans les deux classements - ce sont des stations à fort trafic dans les
+deux sens. En revanche **West St & Chambers St** et **W 21 St & 6 Ave** ne figurent que dans le top des
+arrivées : une station qui reçoit nettement plus de vélos qu'elle n'en émet peut signaler un point d'intérêt
+en fin de trajet (bureaux, correspondance vers un autre mode de transport, zone touristique) qui accumule des
+vélos au cours de la journée - une station à surveiller pour le rééquilibrage manuel du parc.
+
+## Partie B4 - Index géospatial 2dsphere
+
+Voir [geo.js](geo.js) pour le détail complet des commandes.
+
+**Q27.** Sans index, `$near` échoue :
+
+```
+ERREUR : error processing query: ns=citibike.tripsTree: GEONEAR field=start station location maxdist=500
+isNearSphere=0 ... planner returned error :: caused by :: unable to find index for $geoNear query
+```
+
+Un index géospatial est **obligatoire** (et non simplement conseillé comme pour une requête classique) parce
+que `$near` ne fait pas qu'un filtre : c'est intrinsèquement une opération de **tri par distance**, et
+MongoDB n'a aucun moyen de calculer efficacement une distance entre points GeoJSON et de trier par cette
+distance sans une structure d'index spécialisée (2dsphere) qui organise déjà l'espace géographique - sans
+elle, il n'existe tout simplement aucun plan d'exécution possible.
+
+**Q28.**
+
+```js
+db.trips.createIndex({ "start station location": "2dsphere" })
+```
+
+**148 résultats.** Les premiers documents renvoyés viennent tous de la même station la plus proche
+("W 45 St & 6 Ave"), puis de la seconde ("W 45 St & 8 Ave") : `$near` trie les **documents individuels** par
+distance croissante de leur point de départ au point de référence, pas les stations - une station très
+fréquentée et proche remonte donc en bloc avant une station plus éloignée, même moins fréquentée.
+
+**Q29.**
+
+```
+ERREUR : $geoNear, $near, and $nearSphere are not allowed in this context, as these operators require
+sorting geospatial data. If you do not need sort, consider using $geoWithin instead.
+```
+
+`countDocuments()` est en réalité une agrégation déguisée (elle s'exécute via un pipeline `$match` +
+`$count` en interne) - or `$near` n'a de sens que dans un contexte qui produit un curseur trié, ce qu'une
+agrégation de comptage ne fait pas. Le message d'erreur suggère lui-même la solution : `$geoWithin`, qui ne
+trie pas, filtre juste par appartenance à une zone.
+
+```js
+var rad500 = 0.5 / 6378.1;
+var rad1000 = 1 / 6378.1;
+db.trips.countDocuments({ "start station location": { $geoWithin: { $centerSphere: [[-73.9855, 40.7580], rad500] } } })
+db.trips.countDocuments({ "start station location": { $geoWithin: { $centerSphere: [[-73.9855, 40.7580], rad1000] } } })
+```
+
+- Moins de 500 m : **148** trajets
+- Moins de 1000 m : **774** trajets
+
+**Q30.**
+
+```js
+db.stations.createIndex({ position: "2dsphere" })
+db.stations.aggregate([
+  { $geoNear: { near: { type: "Point", coordinates: [-73.9855, 40.7580] }, distanceField: "distanceM", maxDistance: 1000, spherical: true } },
+  { $project: { _id: 1, nom: 1, distanceM: { $round: ["$distanceM", 0] }, departs: 1 } },
+  { $sort: { distanceM: 1 } }
+])
+```
+
+**34 stations** à moins d'1 km de Times Square. La plus proche : **W 45 St & 6 Ave**, à **256 m**.
+
+`$geoNear` doit obligatoirement être le **premier** stage du pipeline parce que, comme `$near`, c'est une
+opération qui a besoin de consulter directement l'index géospatial de la collection source pour calculer et
+trier par distance - une fois que d'autres stages ont déjà transformé ou filtré les documents (donc quitté le
+contexte de la collection indexée), il n'y a plus d'index à consulter pour faire ce calcul.
+
+## Partie B5 - Diagnostic
+
+Voir [diagnostic.md](diagnostic.md) pour le détail complet (tableaux avant/après, extraits de
+`system.profile`).
+
+**Q31.** Avant index sur `start station id` : `COLLSCAN`, 10000 documents examinés pour 36 retournés (ratio
+277,8). Après création de l'index `{ "start station id": 1 }` : `FETCH` + `IXSCAN`, 36 clés et 36 documents
+examinés pour 36 retournés (ratio **1,0**). Le ratio idéal est 1 ; on ne l'atteint pas toujours même avec un
+bon index dès qu'une requête combine plusieurs critères ou porte sur une plage plutôt qu'une égalité stricte
+- il faut alors un index composite (voire une projection couvrante) pour éviter tout `FETCH` superflu.
+
+**Q32.** Profiler activé en niveau 1 (`slowms: 0`) sur un `find` non indexé (`end station name`) et une
+agrégation (`$group` sur `usertype`) : **2 entrées** dans `system.profile`, toutes deux en `planSummary:
+COLLSCAN` (5 ms et 10 ms) - confirmation, via l'activité réelle plutôt qu'un `explain` manuel, que ces deux
+accès ne sont pas optimisés.
+
+**Q33.** Niveaux 0 (désactivé), 1 (seuil `slowms`), 2 (tout enregistrer). En production : niveau 1 avec
+`slowms` autour de 100-200 ms. Deux risques du niveau 2 : surcharge d'écriture sur chaque opération, et
+`db.system.profile.stats().capped` vaut **`true`** - la collection est plafonnée (1 Mo par défaut), donc au
+niveau 2 sur une base chargée les entrées les plus anciennes sont écrasées en quelques secondes, perdant
+potentiellement l'opération lente qui a déclenché l'investigation.
+
+**Q34.**
+
+```js
+db.system.profile.find({ planSummary: "COLLSCAN", millis: { $gt: N } })
+```
+
+isole exactement les opérations qui méritent une indexation prioritaire : lentes **et** en parcours complet.
