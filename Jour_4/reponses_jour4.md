@@ -577,3 +577,166 @@ mais suppose de déjà savoir quelle requête regarder - sert à comprendre *pou
 la correction, par exemple un nouvel index). Cet ordre va du moins coûteux/plus général au plus coûteux/plus
 précis, chaque étape servant à éliminer des hypothèses et à restreindre le périmètre avant d'investir le
 temps nécessaire à un diagnostic fin.
+
+## Bonus (facultatif)
+
+**B1. GridFS.**
+
+```bash
+docker exec mongo-j4 mongofiles -u admin -p ipssi2025 --authenticationDatabase admin --db medias put /tmp/trips.json
+```
+
+```js
+db.fs.files.findOne()
+// { length: 7112796, chunkSize: 261120, uploadDate: 2026-08-27T17:31:15.634Z, filename: '/tmp/trips.json' }
+db.fs.chunks.countDocuments({})   // 28
+```
+
+`length` = 7112796 octets, `chunkSize` = 261120 octets (255 Kio, la taille par défaut d'un chunk GridFS).
+Nombre de chunks retrouvé par le calcul : `Math.ceil(7112796 / 261120)` = **28** - confirmé par le compte
+réel. Taille du dernier chunk : `7112796 - 27*261120` = **62556 octets**, également confirmée en lisant
+directement `fs.chunks.findOne({ n: 27 }).data.length()`.
+
+Script PyMongo ([gridfs_check.py](gridfs_check.py)) qui retélécharge le fichier et vérifie la taille :
+
+```
+longueur en base : 7112796
+taille de chunk : 261120
+date d'upload : 2026-08-27 17:31:15.634000
+taille réellement retéléchargée : 7112796
+correspondance exacte : True
+```
+
+Pour un export de 7 Mo, **GridFS n'est pas justifié** : la limite qu'il contourne (16 Mo par document BSON)
+n'est même pas atteinte ici, un simple document ou un fichier stocké tel quel suffirait. GridFS devient
+pertinent quand le fichier dépasse réellement 16 Mo (vidéos, exports volumineux, images haute résolution) et
+qu'on veut le servir en streaming par plages d'octets directement depuis la base, avec les mêmes garanties de
+réplication/sharding que le reste des données. Au-delà de quelques dizaines de Mo par fichier, ou si les
+fichiers n'ont pas besoin d'être interrogés comme des documents MongoDB, un stockage objet (S3 ou équivalent)
+est presque toujours préférable : moins cher, conçu pour ça, et il ne charge pas le cluster applicatif avec du
+trafic de fichiers binaires.
+
+**B2. `$facet`.**
+
+```js
+db.trips.aggregate([
+  { $facet: {
+      total: [ { $count: "n" } ],
+      parUsertype: [ { $group: { _id: "$usertype", n: { $sum: 1 } } } ],
+      dureeMoyenneGlobale: [ { $group: { _id: null, moy: { $avg: "$tripduration" } } } ]
+  } }
+])
+```
+
+```js
+{ total: [ { n: 10000 } ],
+  parUsertype: [ { _id: 'Subscriber', n: 8011 }, { _id: 'Customer', n: 1989 } ],
+  dureeMoyenneGlobale: [ { _id: null, moy: 1129.9943 } ] }
+```
+
+`$facet` est plus efficace que trois requêtes séparées parce qu'il ne fait **qu'un seul parcours** de la
+collection source, dont il redistribue les documents vers chacune des trois sous-pipelines en parallèle -
+confirmé par l'`explain()` : un unique `COLLSCAN` alimente les trois branches, là où trois `aggregate()`
+indépendants auraient chacun relu les 10000 documents depuis le début.
+
+Sa limite, précisément sur l'usage des index : toutes les sous-pipelines partagent le **même** plan d'entrée.
+Si une sous-pipeline aurait pu bénéficier d'un index différent d'une autre, `$facet` ne peut pas choisir un
+plan par branche - il n'y a qu'un seul scan initial pour tout le monde. Ici, aucun index n'existant sur
+`usertype` ni `tripduration`, les trois branches partagent de toute façon le même `COLLSCAN`, mais le
+principe reste : `$facet` optimise le nombre de parcours, pas le choix d'index par sous-pipeline.
+
+**B3. Index partiel et TTL.**
+
+```js
+db.trips.createIndex({ usertype: 1 }, { name: "usertype_full" })
+db.trips.createIndex({ usertype: 1 }, { name: "usertype_partial_customer", partialFilterExpression: { usertype: "Customer" } })
+db.trips.stats().indexSizes
+```
+
+| Index | Taille |
+|---|---|
+| `usertype_full` (complet) | 65536 octets |
+| `usertype_partial_customer` (partiel, Customer uniquement) | 28672 octets |
+
+Gain : (65536 - 28672) / 65536 = **56,25 %**. L'index partiel ne référence que les 1989 documents Customer
+(20 % du jeu) au lieu des 10000 documents, d'où un index nettement plus léger - cohérent avec la proportion
+de documents couverts.
+
+```js
+db.sessions.insertMany([
+  { sessionId: "s1", createdAt: new Date() },
+  { sessionId: "s2", createdAt: new Date(Date.now() - 3600*1000) }
+])
+db.sessions.createIndex({ createdAt: 1 }, { expireAfterSeconds: 1800 })
+```
+
+Vérification concrète du TTL : `s2`, créé il y a 1h avec un `expireAfterSeconds` de 1800 s (30 min), avait
+**déjà disparu** de la collection au moment du `mongodump` qui a suivi quelques minutes plus tard (seul `s1`
+apparaît dans le dump) - le thread de nettoyage TTL de MongoDB (qui tourne environ chaque minute) a fait son
+travail sans intervention.
+
+**B4. Collection time-series.**
+
+```js
+db.createCollection("trips_ts", {
+  timeseries: { timeField: "start time", metaField: "start station id", granularity: "hours" }
+})
+```
+
+Réimport de `trips.json` dans `trips_ts` (10000 documents). Comparaison de la taille de stockage sur disque
+(`storageSize`, après un `fsync` pour forcer l'écriture) :
+
+| Collection | storageSize |
+|---|---|
+| `trips` (classique) | 1 155 072 octets |
+| `trips_ts` (time-series) | 876 544 octets |
+
+Gain : (1155072 - 876544) / 1155072 ≈ **24,1 %**. Le détail interne (`collStats` sur
+`system.buckets.trips_ts`, la collection qui stocke réellement les données) montre en plus la compression
+propre aux buckets time-series : 2 968 148 octets de mesures groupées compressés à 2 017 231 octets, soit
+environ 32 % de réduction à ce niveau, avant même la compression du moteur de stockage. Les 10000 mesures ont
+été regroupées en **2436 buckets** (une taille moyenne de 1898 octets par bucket).
+
+Opérations perdues, vérifiées concrètement :
+- `db.trips_ts.updateOne({}, { $set: { tripduration: 999 } })` échoue avec `Cannot perform a non-multi
+  update on a time-series collection` - seules les mises à jour multi-documents (`updateMany`) sont permises.
+- `db.trips_ts.createIndex({ tripduration: 1 }, { unique: true })` échoue avec `Unique indexes are not
+  supported on time-series collections`.
+
+**B5. Rejouer la démo du formateur.**
+
+```bash
+mongodump -u admin -p ipssi2025 --authenticationDatabase admin --db citibike --out /tmp/backup
+mongorestore -u admin -p ipssi2025 --authenticationDatabase admin --nsFrom "citibike.*" --nsTo "citibike_test.*" /tmp/backup
+```
+
+**12899 documents restaurés** (10000 trips + 462 stations + 1 session + 2436 buckets time-series), 0 échec.
+
+**Le point que la plupart des équipes oublient** : vérification des index de `citibike_test.trips` après
+restauration.
+
+```js
+db.trips.getIndexes()
+```
+
+Les 4 index personnalisés créés plus haut (`usertype_full`, `usertype_partial_customer` avec son
+`partialFilterExpression` intact, `start station location_2dsphere`, `start station id_1`) sont **tous
+revenus**, en plus de `_id_`. Ils ne viennent d'aucune recréation applicative : le log de `mongorestore`
+montre explicitement `restoring indexes for collection ... from metadata`, c'est-à-dire qu'ils sont
+reconstruits à partir des fichiers `.metadata.json` produits par `mongodump` - la définition complète de
+chaque index (y compris un filtre partiel) fait partie de la sauvegarde, pas seulement les données.
+
+```js
+db.createUser({ user: "analyste", pwd: "analyste2025", roles: [{ role: "read", db: "citibike_test" }] })
+db.createUser({ user: "appli", pwd: "appli2025", roles: [{ role: "readWrite", db: "citibike_test" }] })
+```
+
+Test du moindre privilège :
+
+| Utilisateur | Lecture | Écriture |
+|---|---|---|
+| `analyste` (rôle `read`) | OK (10000 documents comptés) | **Refusée** : `not authorized on citibike_test to execute command { insert: ... }` |
+| `appli` (rôle `readWrite`) | OK | OK (insertion puis suppression confirmées) |
+
+Le refus d'écriture pour `analyste` n'est pas une supposition : c'est l'erreur exacte renvoyée par le
+serveur en tentant l'opération avec ses identifiants.
